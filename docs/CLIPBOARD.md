@@ -12,11 +12,6 @@
 合成 **host** 侧的 `wl_data_source` 并 `set_selection`，从而让 ChromeOS host 和
 所有 guest 应用同时看到它。
 
-上一版功能矩阵里写的「X11 → ChromeOS host 剪贴板导出未实现」是事实，但附带的
-理由（「协议错误会断开整条 host 连接；在缺少真实设备验证的条件下本次不引入」）
-站不住脚：主线已经给出了完整的状态机与对象生命周期，风险可以用内部对象隔离和
-离线单元测试控制，而不是跳过实现。本版把它补齐了。
-
 ## 2. 主线代码位置
 
 | 主线位置 | 作用 |
@@ -48,7 +43,7 @@
 ### 3.1 三个方向
 
 ```
-X11 → ChromeOS host（本版补齐）
+X11 → ChromeOS host
   X11 app 复制 → XFixes owner 变化
     → WM: ConvertSelection(CLIPBOARD, TARGETS, _WL_SELECTION)
     → X11Bridge::set_clipboard_targets(names)   [generation++]
@@ -61,11 +56,11 @@ X11 → ChromeOS host（本版补齐）
     → X11Bridge::set_clipboard_data(atom, bytes)
     → proxy: 写回 host 提供的 fd 并关闭
 
-X11 → guest Wayland（上一版已有，保留）
+X11 → guest Wayland
   XFixes owner 变化 → TARGETS → 合成 guest wl_data_device.data_offer /
   offer / selection；wl_data_offer.receive → ConvertSelection → 写回 guest fd
 
-host / guest Wayland → X11（上一版已有，本版补 owner 争夺）
+host / guest Wayland → X11
   host offer 或 guest data_source 的 MIME / 文本载荷
     → WmEvent::ClipboardTargets / ClipboardData
     → ClipboardBridge::note_targets / note_data + claim_clipboard()
@@ -95,8 +90,7 @@ host / guest Wayland → X11（上一版已有，本版补 owner 争夺）
 `wl_data_offer.receive()` 的 MIME。X11 侧唯一"新增"的 target 是
 `sl_set_selection()` 在数组开头插入的 `TARGETS` 与 `TIMESTAMP`。
 
-本版早期自造了 `UTF8_STRING ↔ text/plain;charset=utf-8` 双向转换，这会让
-ChromeOS host 看到与主线不同的 MIME 名，属于不必要的区别。现在改为：
+实现与主线保持一致：
 
 - `mime_for_x11_target()` / `x11_target_for_mime()` 恒等，控制 atom
   （`TARGETS`/`TIMESTAMP`/`MULTIPLE`/`SAVE_TARGETS`/`_WL_SELECTION`）过滤；

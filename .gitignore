@@ -1,4 +1,11 @@
 /target
-.worktrees
 /dist
+.worktrees
 
+# editor / merge leftovers
+*.rs.bk
+*.orig
+*.rej
+*.swp
+.idea/
+.vscode/

@@ -20,9 +20,9 @@
 # binary with dpkg-shlibdeps, so the .deb matches the distro it was built on.
 #
 #   bash packaging/build-deb.sh
-#   OUT_DIR=/tmp PKG_VERSION=0.3.4-r bash packaging/build-deb.sh
+#   OUT_DIR=/tmp PKG_VERSION=<version> bash packaging/build-deb.sh
 #
-# Requires: cargo/rustc, dpkg-deb, dpkg-shlibdeps, strip, coreutils.
+# Requires: cargo/rustc, dpkg, dpkg-deb, dpkg-shlibdeps (dpkg-dev), strip, coreutils.
 # The build dependencies of the Rust crates are the ones listed in README.md
 # ("构建"): libxkbcommon-dev libgbm-dev libdrm-dev libexpat1-dev.
 
@@ -39,20 +39,21 @@ if [ -f "$HOME/.cargo/env" ]; then
     . "$HOME/.cargo/env" 2>/dev/null || true
 fi
 
-# sommelier/Cargo.toml is a historical CRLF file, so the pattern must tolerate
-# a trailing \r instead of anchoring on `"` immediately before end-of-line.
-VERSION="${PKG_VERSION:-$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$ROOT/sommelier/Cargo.toml" | head -n 1)}"
+# .gitattributes pins text files to LF, so a strict version match is enough.
+VERSION="${PKG_VERSION:-$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$ROOT/sommelier/Cargo.toml" | head -n 1)}"
 ARCH="${PKG_ARCH:-$(dpkg --print-architecture)}"
 OUT_DIR="${OUT_DIR:-$ROOT/dist}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 BUILD_DIR="$CARGO_TARGET_DIR/deb-build"
 STAGE="$BUILD_DIR/sommelier-rs-r_${VERSION}_${ARCH}"
 DEB="$OUT_DIR/sommelier-rs-r_${VERSION}_${ARCH}.deb"
+# Override with PKG_MAINTAINER when publishing from a fork.
+MAINTAINER="${PKG_MAINTAINER:-sommelier-rs-r contributors <noreply@example.com>}"
 
 [ -n "$VERSION" ] || die "cannot read version from sommelier/Cargo.toml"
 dpkg --validate-version "$VERSION" >/dev/null 2>&1 || die "invalid Debian version: $VERSION"
 
-for tool in cargo dpkg-deb dpkg-shlibdeps strip install; do
+for tool in cargo dpkg dpkg-deb dpkg-shlibdeps strip install; do
     command -v "$tool" >/dev/null 2>&1 || die "missing tool: $tool"
 done
 
@@ -81,19 +82,22 @@ done
 
 install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/sommelier-rs-r/README.md"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/sommelier-rs-r/copyright"
+# Every docs/*.md is shipped; systemd units point Documentation= at
+# CROSTINI_INSTALL.md inside this directory.
 for doc in "$ROOT"/docs/*.md; do
     [ -f "$doc" ] || continue
     install -m 0644 "$doc" "$STAGE/usr/share/doc/sommelier-rs-r/$(basename "$doc")"
 done
 
-# dpkg-shlibdeps expects a debian/control in the cwd; the temporary one only
-# exists so it can resolve ${shlibs:Depends} for the real binary.
+# Two control files with different consumers: this temporary source control
+# exists only so dpkg-shlibdeps can resolve ${shlibs:Depends} for the staged
+# binary; $STAGE/DEBIAN/control below is the one shipped inside the .deb.
 mkdir -p "$BUILD_DIR/debian"
 cat > "$BUILD_DIR/debian/control" <<EOF
 Source: sommelier-rs-r
 Section: utils
 Priority: optional
-Maintainer: sommelier-rs-r contributors <noreply@example.com>
+Maintainer: $MAINTAINER
 Standards-Version: 4.7.0
 
 Package: sommelier-rs-r
@@ -105,7 +109,9 @@ DEPS="$(cd "$BUILD_DIR" && dpkg-shlibdeps -O "$STAGE/usr/bin/sommelier-rs-r" 2>/
         | sed -n 's/^shlibs:Depends=//p' | head -n 1 || true)"
 if [ -z "$DEPS" ]; then
     echo "==> dpkg-shlibdeps produced no substitution; using the known Crostini dependency set"
-    DEPS="libc6, libgcc-s1, libxkbcommon0, libgbm1, libdrm2, libexpat1"
+    # Fallback matching the Debian 13 / Crostini shlibs result; libdrm2 and
+    # libexpat1 arrive transitively via libgbm1 and need no direct entry.
+    DEPS="libc6, libgcc-s1, libxkbcommon0, libgbm1"
 fi
 echo "==> Depends: $DEPS"
 
@@ -116,10 +122,9 @@ Section: utils
 Priority: optional
 Architecture: $ARCH
 Installed-Size: $(du -sk "$STAGE/usr" | cut -f 1)
-Maintainer: sommelier-rs-r contributors <noreply@example.com>
+Maintainer: $MAINTAINER
 Depends: $DEPS
 Suggests: xwayland
-Homepage: https://github.com/google/sommelier-rs
 Description: X11-capable Wayland proxy for ChromeOS Crostini (Rust)
  A Rust implementation of the sommelier Wayland proxy used inside Crostini
  Linux containers. It forwards Wayland globals from the ChromeOS host over

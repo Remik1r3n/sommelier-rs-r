@@ -69,11 +69,8 @@ pub enum WmCommand {
 
 /// Events sent from the Wayland proxy to the WM thread.
 ///
-/// The clipboard variants are part of the X11↔Wayland selection bridge: the
-/// WM thread already handles them (`wm.rs::handle_wm_event`), but the proxy
-/// does not yet synthesize them from guest `wl_data_source` offers. They are
-/// kept in the protocol so wiring that direction needs no format change.
-#[allow(dead_code)]
+/// The clipboard variants carry guest `wl_data_source` offers and X11
+/// selection payloads between `x11/selection.rs` and the WM loop.
 #[derive(Debug, Clone)]
 pub enum WmEvent {
     Configure {
@@ -100,7 +97,6 @@ pub enum WmEvent {
     RequestClipboardData {
         target: String,
     },
-    Shutdown,
 }
 
 /// Channel/state hub shared by the proxy and the dedicated WM OS thread.
@@ -153,9 +149,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// Clipboard query helpers and reverse lookups are exercised by the bridge
-// unit tests and reserved for the X11<->Wayland selection wiring; see
-// docs/FEATURE_MATRIX.md section 6.
+// Reverse-lookup and runtime-state getters are currently read only by the
+// bridge unit tests, while their setters are on the production path. Keep both
+// sides of the state machine together instead of splitting them by cfg(test).
 #[allow(dead_code)]
 impl X11Bridge {
     /// Create the bridge and return the command receiver owned by the proxy.
@@ -293,10 +289,9 @@ impl X11Bridge {
 
     // ----- clipboard helpers (X11 -> Wayland direction) -----
     //
-    // `WmCommand` intentionally has no clipboard variants so that the proxy's
-    // `match` stays exhaustive with exactly the six window commands. The WM
-    // thread therefore publishes CLIPBOARD/TARGETS results here and the proxy
-    // polls them via `take_clipboard_targets()` / `take_clipboard_data()`.
+    // The WM thread publishes CLIPBOARD/TARGETS results here. The proxy reads
+    // them non-destructively via `clipboard_targets_snapshot()` so every guest
+    // connection can build its own `wl_data_offer`.
 
     /// Publish the TARGETS list obtained from an X11 CLIPBOARD owner.
     /// Every publish is a new generation so each guest connection can
@@ -316,8 +311,8 @@ impl X11Bridge {
         (gen, lock(&self.clipboard_targets).clone())
     }
 
-    /// Consume the most recently published TARGETS list, if any. Kept for
-    /// callers that want a one-shot read (unit tests / diagnostics).
+    /// Consume the published TARGETS list (one-shot read for unit tests).
+    #[cfg(test)]
     pub fn take_clipboard_targets(&self) -> Option<Vec<String>> {
         lock(&self.clipboard_targets).take()
     }

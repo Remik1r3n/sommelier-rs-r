@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Unified configuration: upstream `sommelier` flags + `SOMMELIER_*` env vars
-//! + the flags from both `sommelier-rs` branches.
+//! Unified configuration: mainline `sommelier` flags, `SOMMELIER_*` env vars
+//! and the transport options for all three host backends.
 //!
 //! Mainline rule of thumb (README.md: "every option has a corresponding
 //! environment variable, command line overrides environment") is preserved.
@@ -133,11 +133,13 @@ pub struct Args {
     #[arg(long)]
     pub viewport_resize: bool,
 
-    /// Accelerators reserved by the host (ChromeOS shortcuts).
+    /// Accelerators reserved by the host (ChromeOS shortcuts). The runtime
+    /// reads `SOMMELIER_ACCELERATORS` directly in `Context::new`.
     #[arg(long, env = "SOMMELIER_ACCELERATORS")]
     pub accelerators: Option<String>,
 
-    /// Accelerators reserved only while not fullscreen.
+    /// Accelerators reserved only while not fullscreen. Parsed for mainline
+    /// CLI compatibility; the runtime does not implement this subset.
     #[arg(
         long,
         alias = "windowed_accelerators",
@@ -277,9 +279,11 @@ pub struct Args {
     pub runprog: Vec<String>,
 
     // ---- mainline compatibility flags -----------------------------------
-    // These are accepted with the same spelling as upstream sommelier. Flags
-    // whose behaviour we do not implement yet are parsed and logged so an
-    // upstream-style command line does not fail to start.
+    // These are accepted with the same spelling as upstream sommelier so an
+    // upstream-style command line does not fail to start. Flags whose behaviour
+    // is not implemented are parsed and intentionally ignored; see
+    // docs/MAINLINE_PARITY.md for the supported subset. Do not delete these
+    // fields when pruning unused code: they are part of the CLI contract.
     /// Mainline spelling of `--gpu-accel` (sommelier.cc:4318).
     #[arg(long)]
     pub enable_linux_dmabuf: bool,

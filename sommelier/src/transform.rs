@@ -31,10 +31,9 @@ limitations under the License.
 //! 分支（viewport_override、buffer contents_scale、scale_round_on_x/y、
 //! per-surface own_scale）在这里由调用方负责；详见文件末尾的简化说明。
 
-// 本模块刻意保留完整的变换 API 面（定点运算、按输出推断、damage/viewport
-// 换算等），其中一部分当前只被单元测试或后续的 pointer/viewport 接线调用，
-// 在非测试构建中会触发 dead_code lint。它们对应主线 sommelier 的公开变换
-// 能力，属于有意保留而非遗漏。
+// This module mirrors the full transform API of `sommelier-transform.cc`.
+// The output/viewport handlers use a subset; the rest is covered by unit tests
+// and kept so the Rust implementation stays aligned with the mainline.
 #![allow(dead_code)]
 
 /// `--scale` 的下界（主线 MIN_SCALE）。
@@ -68,9 +67,9 @@ pub enum ScalingMode {
 
 /// 单个 host wl_output 的几何信息。
 ///
-/// `width_mm` / `height_mm` / `subpixel` / `host_scale` 是 wl_output
-/// geometry/scale 事件的透传数据，供后续接线读取；本纯逻辑模块主要消费
-/// `x`/`y`/`physical_*`/`transform`/`device_scale_factor`。
+/// 对应一个 host `wl_output`。缩放路径消费
+/// `x`/`y`/`physical_*`/`transform`/`device_scale_factor`，其余字段原样记录
+/// geometry/scale 事件。
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OutputGeometry {
@@ -106,19 +105,6 @@ pub struct Transform {
 /// 等价于主线 `wl_fixed_from_double(wl_fixed_to_double(v) * (num/den))`。
 pub fn fixed_mul(v: i32, num: i32, den: i32) -> i32 {
     fixed_mul_frac(v, num as i64, den as i64)
-}
-
-/// wl_fixed 原始值与 f64 互转（全程 f64，不经过 f32，供接线层使用）。
-/// 保留供 pointer/touch 定点坐标接线使用，当前变换走 `fixed_mul_frac`。
-#[allow(dead_code)]
-pub fn fixed_from_double(d: f64) -> i32 {
-    sat_i32((d * WL_FIXED_ONE as f64).trunc())
-}
-
-/// wl_fixed 原始值与 f64 互转（全程 f64，不经过 f32，供接线层使用）。
-#[allow(dead_code)]
-pub fn fixed_to_double(v: i32) -> f64 {
-    v as f64 / WL_FIXED_ONE as f64
 }
 
 /// [`fixed_mul`] 的高精度版本，允许 i64 的分子/分母。

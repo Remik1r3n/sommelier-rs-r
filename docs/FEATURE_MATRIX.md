@@ -56,14 +56,14 @@
 | `--dpi` 桶与 physical mm 换算 | ✅ | `transform.rs::physical_size_for_dpi` |
 | `wl_fixed` 24.8 定点变换（无 f32 精度损失） | ✅ | `transform.rs::fixed_mul_frac` |
 | `wl_output.geometry/mode/scale/name/description/done` 改写 | ✅ | `handler/output.rs`（本次接入运行时） |
-| `zxdg_output_v1.logical_position/logical_size` 改写 | ✅ | `handler/output.rs`；按主线 `sommelier.cc:759-775`，`zxdg_output_manager_v1` **不向 guest 公布**（仅 `--direct-scale` 时内部 bind），handler 保留用于 host 内部状态 |
+| `zxdg_output_v1.logical_*` handler | ⚠️ | `zxdg_output_manager_v1` **不向 guest 公布、也不在 host 侧内部 bind**；handler 保留但不会触发。direct 模式用 `wl_output` 几何 + `Transform` 换算，见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4 |
 | `wp_fractional_scale_v1.preferred_scale` 改写 | ✅ | `handler/output.rs` |
 | 多输出布局、按位置推断输出、虚拟桌面尺寸 | ✅ | `transform.rs::set_outputs` / `virtual_dimensions` |
-| per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通 |
+| per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通。已可用，但未复刻主线 `viewport_pointer_scale` 指针补偿（见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4） |
 | `wl_surface.damage_buffer` 支持开关 | ✅ | 与主线 `sommelier-compositor.cc:1170` 一致：guest global 固定 **v4**（`--no-support-damage-buffer` / `SOMMELIER_SUPPORT_DAMAGE_BUFFER≠1` 时 v3），host bind 恒 v3；v4 `damage_buffer` 请求由 `handler/compositor.rs` 改写为按坐标系变换的 `damage` |
 | `preferred_scale` 严格等价于主线 `round(wire_scale / scale)` | ✅ | 保留 1/120 精度，不再量化到 120 的整数倍；含分数 scale 单测 |
 
-## 4. ChromeOS 专有能力（保留自 `virtwl`）
+## 4. ChromeOS 专有能力
 
 | 能力 | 状态 |
 |---|---|
@@ -82,19 +82,19 @@
 |---|---|---|
 | 每 guest client 一条独立 host 连接 | ✅ | `proxy.rs::spawn_client` |
 | `ShadowTable` guest↔host ID 映射、interface 跟踪、host-only 对象 | ✅ | `state.rs` |
-| server-created object（`event new_id`）ID 重映射 | ✅ | `generator.rs` 通用修复（原先是恒等映射） |
+| server-created object（`event new_id`）ID 重映射 | ✅ | `generator.rs` 通用重映射 |
 | `wl_data_device.data_offer` 手写重映射 | ✅ | `handler/data_device.rs`，与通用路径互补 |
 | `wl_data_offer.receive` 跨 VM 管道 + tokio pump | ✅ | `VIRTWL_IOCTL_NEW_PIPE_READ` |
 | SHM 四级降级分配 | ✅ | `handler/shm.rs` + `allocator.rs`（sealed memfd 防 SIGBUS） |
 | registry global 过滤（deny-list + 内部协议） | ✅ | `handler/registry.rs` + `protocols::all::is_known()`；X11 连接按主线不公布 `wl_data_device_manager` / `xdg_wm_base` |
 | 未知 opcode 只丢单条消息、不杀连接 | ✅ | `proxy.rs::handle_msgs` |
-| EOF 判定 `bytes == 0 && read_fds.is_empty()` | ✅ | 从 `main` 回补 |
+| EOF 判定 `bytes == 0 && read_fds.is_empty()` | ✅ | `proxy.rs::Client::run` |
 | 方向分离的 sender id | ✅ | `last_guest_sender_id` / `last_host_sender_id` |
 | 协议 codegen 从 XML 自动枚举 | ✅ | `build.rs` 扫描目录，33 个 XML → 33 个模块 + 聚合分发 |
 | 聚合 `dispatch_request` / `dispatch_event` / `impl_generated_delegates!` | ✅ | `wayland_codegen/src/aggregate.rs` |
-| `&str` handler 参数（非 `&String`） | ✅ | 从 `main` 取回并统一全部手写 handler |
+| `&str` handler 参数（非 `&String`） | ✅ | codegen 与全部手写 handler 统一使用 `&str` |
 | 内部绑定协议的 host event 隔离 | ✅ | `aggregate.rs::INTERNAL_ONLY` 覆盖 10 个纯内部模块；text-input v1 / extension 因需要转 v3 事件而有意保留转发 |
-| 主线式 global 版本钳制 | ✅ | `advertised_version()` / `host_bind_version()`：compositor 4/3、output ≤3、seat ≤5、data_device_manager ≤3、xdg_wm_base ≤3、dmabuf ≤4、text-input-extension ≤11、wl_drm ≤2 |
+| 主线式 global 版本钳制 | ✅ | `advertised_version()` / `host_bind_version()`：compositor 4/3、output ≤3、seat ≤5、data_device_manager ≤3、xdg_wm_base ≤3、dmabuf ≤4、text-input-extension ≤11、wl_drm ≤2。`wl_drm` 仅透传并钳制版本，本地模拟未实现，见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4 |
 | `damage_buffer` → `damage` 改写 | ✅ | `handler/compositor.rs`，含 2 个单测 |
 | quirks textproto-like 规则（steam_game_id / always / enable / disable / merge） | ✅ | `quirks.rs`；不引入 protobuf，多 condition 整条跳过 |
 | 主线 CLI + `SOMMELIER_*` 环境变量 | ✅ | `config.rs`，12 个配置单测；`--socket`/`--display`/位置参数语义与主线一致。逐项对照见 [`docs/MAINLINE_PARITY.md`](MAINLINE_PARITY.md) |
@@ -120,13 +120,6 @@
 分发层直接丢弃，避免把 host 对象 id 注入 guest。
 
 ## 6. 已知限制（按影响排序）
-
-> **修订说明**：此前 §6.1 记录的「X11 → ChromeOS host 剪贴板导出未实现」已补齐。
-> 主线 C++ `sommelier` 本来就有完整的双向剪贴板（`sommelier.cc` 的
-> `sl_set_selection` / `sl_get_selection_targets` / `sl_begin_data_source_send`），
-> 上一版把它误判为「需要真机才能做」的风险项，并用 guest 侧合成 offer 代替了
-> host 侧合成 source，方向不对。现按主线语义实现，逐行对照与链路图见
-> [`docs/CLIPBOARD.md`](CLIPBOARD.md)。
 
 1. **ChromeOS host 侧的人工交互尚未验证。** Wayland 与 X11 两条主链路已在
    Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通（见 §7 与
@@ -163,19 +156,7 @@
 | CLI 参数解析 | ✅ 用独立 clap crate 在 Windows 本机**实跑** 6 组形状验证全部通过：`--socket` vs `--display`、位置参数 runprog、`--` 分隔、`--sd-notify` 不吃位置参数、全量主线 flag 拼写、`--help`/`--version` |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
-| Rust 源码规模 | 19,283 行（`sommelier/src` + `wayland_codegen/src`） |
+| Rust 源码规模 | 约 1.9 万行（`sommelier/src` + `wayland_codegen/src`；用 `git ls-files "*.rs" | xargs wc -l` 复核） |
 | 真机端到端 | **已验证**：virtwl → host globals/事件、guest registry 与版本钳制、`gtk_shell1`/text-input-v3 synthetic global、Xwayland `:9` 启动、WM 管理真实 X11 窗口并映射为 host `xdg_toplevel`、RandR 模拟、X11 ↔ guest 剪贴板往返、键盘焦点。详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5 |
 | 真实设备运行 | ✅ 已在 Debian 13 / `penguin` / `/dev/wl0` 真机运行（独立 `wayland-wb` / `:9`，现役 `wayland-0/1`、`:0/:1` 未受影响）；仍未覆盖 host 侧人工交互，见 §6 第 1 项 |
-| Debian `.deb` 交付 | ✅ `packaging/build-deb.sh` 在真机上构建 `sommelier-rs-r_0.3.4-r_amd64.deb`（release + strip + `dpkg-shlibdeps` 解析依赖），随包附带两个 disabled-by-default systemd user 模板与全量文档；已实机 `dpkg -i` 安装并验证两个单元均秒级 `active`。安装与使用见 [`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)，打包验证见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.4 |
-
-### 合并过程中修掉的既有缺陷
-
-1. `event new_id` 恒等映射 → 通用 `allocate_guest_server_id()` 重映射；
-2. 解析失败直接杀连接 → 区分 `UnknownOpcode`（丢单条）与其它协议错误；
-3. `last_sender_id` 方向混用 → 增加方向专用字段，旧字段保持兼容；
-4. `--virtgpu-channel` 是死参数 → 真正接入 `connect_host()`；
-5. `VirtGpuChannel::new()` / `Allocator::new()` 不支持指定设备 → `new_with_device` / `with_device`；
-6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.4-r`）；
-7. `virtwl` 的 `&String` handler 参数 → 回退为 `&str`；
-8. `WaylandConnection::new` 未设 `O_NONBLOCK`（virtwl 修复，已保留）；
-9. EOF 误断连（main 修复，已回补）。
+| Debian `.deb` 交付 | ✅ `packaging/build-deb.sh` 在真机上构建 `sommelier-rs-r_<版本>_amd64.deb`（release + strip + `dpkg-shlibdeps` 解析依赖），随包附带两个 disabled-by-default systemd user 模板与全量文档；已实机 `dpkg -i` 安装并验证两个单元均秒级 `active`。安装与使用见 [`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)，打包验证见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.4 |

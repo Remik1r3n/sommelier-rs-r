@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Host buffer allocation, merged from the two upstream branches.
+//! Host buffer allocation.
 //!
-//! `main` used a sealed `memfd` (no `/dev/dri` dependency, immune to the
-//! SIGBUS-on-truncate class of bugs); `virtwl` used a GBM BO (zero-copy when a
-//! render node exists). Both are useful, so this module prefers GBM and falls
-//! back to sealed memfd. Callers only see the unified [`AllocatedBuffer`],
-//! which keeps whichever backing object alive for the buffer's lifetime.
+//! A GBM BO is preferred when a render node exists (zero-copy); otherwise a
+//! sealed `memfd` is used, which needs no `/dev/dri` and is immune to the
+//! SIGBUS-on-truncate class of bugs. Callers only see [`AllocatedBuffer`],
+//! which keeps the backing object alive for the buffer's lifetime.
 
 use std::fs::OpenOptions;
 use std::io;

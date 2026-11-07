@@ -149,14 +149,13 @@ impl ClipboardBridge {
     }
 
     /// True when at least one SelectionRequest is waiting for Wayland data.
-    /// Exposed for diagnostics and unit tests; the WM uses `flush_pending`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn has_pending_requests(&self) -> bool {
         !self.pending.is_empty()
     }
 
-    /// TARGETS currently known from the Wayland side (diagnostics/tests).
-    #[allow(dead_code)]
+    /// TARGETS currently known from the Wayland side (unit tests).
+    #[cfg(test)]
     pub fn targets(&self) -> &[String] {
         &self.targets
     }

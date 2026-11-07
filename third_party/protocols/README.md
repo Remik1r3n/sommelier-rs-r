@@ -4,18 +4,11 @@
 （基于 `quick-xml` + `serde`，见 `wayland_codegen/src/protocol.rs`）在构建期解析
 这些文件并生成 Rust 代码；`<protocol name="...">` 即生成的 Rust 模块名。
 
-## 本次补齐内容
+## 构建接入
 
-- **本地复制 12 个**：直接取自 ChromeOS 主线 sommelier 的
-  `sommelier/protocol/`，保持原文件名不变。
-- **上游下载 10 个**：通过本地代理 `127.0.0.1:1088` 从 wayland-protocols 上游
-  `main` 分支 raw 文件下载（gitlab.freedesktop.org）。
-- **原有 11 个**：按要求保留不动。
-- 合计 **33 个 `.xml`**，另加本 `README.md`（本目录唯一允许新建的非 XML 文件）。
-
-> **重要提示**：`sommelier/build.rs` 目前以**显式数组**只登记了原有 11 个协议，
-> 并不扫描本目录。因此本次新增的 22 个文件已就位，但**尚未接入构建**；如需启用，
-> 需在 `build.rs` 中登记（本次任务禁止修改 build.rs / main.rs / *.rs / Cargo.toml）。
+`sommelier/build.rs` 在构建期自动枚举本目录下全部 `.xml`（当前 33 个），
+生成同名 Rust 模块与 `protocols::all` 聚合分发。新增协议只需放入 XML，
+无需在 `build.rs` 或 `proxy.rs` 手工登记。
 
 ## 文件清单
 
@@ -61,69 +54,6 @@
 
 上游文件完整 URL 前缀：
 `https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/main/`。
-
-## 校验结果
-
-校验依据：`wayland_codegen/src/protocol.rs` 中 `serde` 结构体可识别的元素/属性，
-以及任务给出的 schema 清单。工具：`python3` + `xml.etree.ElementTree`。
-
-### 1. well-formed
-全部 **33/33** 通过 `ET.fromstring()`。所有文件均**无 DOCTYPE**（不会触发外部 DTD 读取）。
-
-### 2. protocol name / interface / version
-- 所有 `<protocol name>` 与 `<interface name>` 均为合法 Rust 标识符（`snake_case`，
-  无连字符、无点号），可直接作为模块名 / `format_ident!` 使用。
-- 所有 `<interface version>`、`<request/event/entry since>` 均为整数（`u32` 可解析）。
-- 每个文件的 protocol name 与 interface 列表见上表。
-
-### 3. 元素 / 属性是否超出可识别集合
-`protocol.rs` 识别的元素仅 9 种：`protocol`、`copyright`、`description`、
-`interface`、`request`、`event`、`arg`、`enum`、`entry`。
-
-- 33 个文件均**只使用这 9 种元素名**，无未知元素名；层级关系均合法
-  （`protocol>copyright/description/interface`、`interface>description/request/event/enum`、
-  `request/event>description/arg`、`enum>description/entry`）。
-- 新增 22 个文件中**无**未知属性、无非法值、无 `<arg type="new_id">` 缺 `interface`。
-- 因此 **0 个文件会导致 quick-xml 解析报错**。
-
-### 4. 超出「任务列出 schema」但被解析器容忍的构造（不报错，文件仍安全）
-
-| 文件 | 构造 | 说明 |
-|---|---|---|
-| `content-type-v1.xml` | `<entry><description>` 嵌套 | `<entry>` 内带说明文本，超出严格 schema；但原有 `xdg-shell.xml`（build.rs 明确引用、已编译）就有 20 处同类结构，证明解析器容忍 |
-| `pointer-constraints-unstable-v1.xml` | `<entry><description>` 嵌套 | 同上 |
-| `presentation-time.xml` | `<entry><description>` 嵌套；`<event type="destructor">` | `event@type` 超出任务列出的 `<event name since>`；但 codegen 的 `Message` 结构为 request/event 共用，带 `@type` 字段，不会报错 |
-| `tearing-control-v1.xml` | `<entry><description>` 嵌套 | 同上 |
-| `drm.xml` | `<enum since="...">` | `since` 在任务列出的 `<enum name since bitfield>` 内；codegen 的 `Enum` 结构无 `@since` 字段，serde 默认静默忽略，无害 |
-
-补充：原有 `wayland.xml` / `linux-dmabuf-v1.xml` 还包含 `<event deprecated-since>`
-属性，同样被 serde 静默忽略，进一步印证「未知属性不报错」。
-
-### 5. `<arg type="new_id">` 缺 `interface`
-- 新增 22 个文件：**0 处**。
-- 唯一一处出现在**原有** `wayland.xml`（`wl_registry.bind` 的 `id` 参数）。
-  `generator.rs::map_type` 已将其映射为 `(String, u32, u32)` 元组，不会报错。
-
-### 6. interface 名重复（会导致同名模块）
-- 新增 22 个文件 **vs** 原有 11 个文件：**无重复**。
-- 新增文件彼此之间：**无重复**。
-- 易混淆但**不冲突**的例子：`xdg-dialog-v1.xml` 定义 `xdg_wm_dialog_v1`，
-  与 `xdg-shell.xml` 的 `xdg_wm_base` 不同；`xdg-output-unstable-v1.xml` 的
-  `zxdg_output_manager_v1` / `zxdg_output_v1` 与 `xdg-decoration-unstable-v1.xml`
-  的 `zxdg_decoration_manager_v1` / `zxdg_toplevel_decoration_v1` 不同。
-
-### 7. 安全判定
-22 个新增文件**全部安全**：well-formed、元素/属性在可解析范围内、模块名合法、
-无 interface 重名、无 `new_id` 缺 interface。
-
-## 下载失败清单
-
-**无失败**。10 个上游文件全部经代理下载成功（HTTP 200，内容为真实 XML，
-已校验 `<protocol>` 根元素），未创建任何占位/伪造 XML。
-
-- `fractional-scale-v1.xml`：按要求跳过（已存在）。
-- `xdg-dialog-v1.xml`、`tearing-control-v1.xml`、`linux-drm-syncobj-v1.xml`：
-  上游 staging 路径下均存在，已成功下载，无需跳过。
 
 ## 许可 / 出处汇总
 

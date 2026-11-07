@@ -165,8 +165,8 @@ impl Client {
                 res = self.client_conn.recv() => {
                     match res {
                         Ok(bytes) => {
-                            // Restored from `main`: an EOF with pending fds is
-                            // not a disconnect (SCM_RIGHTS can outlive data).
+                            // An EOF with pending fds is not a disconnect
+                            // (SCM_RIGHTS can outlive data).
                             if bytes == 0 && self.client_conn.read_fds.is_empty() { break; }
                             if !self.handle_msgs(Direction::ClientToHost).await { break; }
                         }
@@ -964,7 +964,7 @@ impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 protocols::all::impl_generated_delegates!(SommelierHandler);
 
 // ---------------------------------------------------------------------------
-// Host connection construction (merged from both branches)
+// Host connection construction
 // ---------------------------------------------------------------------------
 
 type HostConnection = (

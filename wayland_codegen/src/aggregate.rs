@@ -17,11 +17,9 @@ limitations under the License.
 //! Generates one aggregate module that unifies dispatch across every protocol
 //! XML in the workspace.
 //!
-//! Upstream `sommelier-rs` had a hand-maintained `if / else if` chain in
-//! `proxy.rs` (one arm per protocol) and a hand-maintained safelist in
-//! `registry.rs`. Adding a protocol meant editing four files and was the main
-//! reason the two branches drifted. Here the build script derives both from the
-//! same parsed XML list, so adding a protocol is a single `build.rs` edit.
+//! The dispatch table and the internal-global safelist are both derived from
+//! the same parsed XML list, so adding a protocol needs no hand-maintained
+//! `if / else if` chain in `proxy.rs` or safelist in `registry.rs`.
 
 use crate::protocol::{Interface, Protocol, ProtocolItem};
 use proc_macro2::{Ident, TokenStream};

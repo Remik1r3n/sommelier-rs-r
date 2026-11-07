@@ -166,8 +166,9 @@
   5 组断言全部通过 —— `--socket` vs `--display`、位置参数 runprog、`--`
   分隔、`--sd-notify` 不吃位置参数、`--scale=1.5junk` / `--dpi=96.5,nonsense`
   宽松解析、全量主线 flag 拼写。
-- 开发机只能 `cargo check --tests`（无 Linux linker、WSL 被安全策略禁用），
-  **测试二进制从未真正运行过**，这正是 §1.5 第 3 项能漏到真机的原因。
+- 开发机（Windows）当时只能 `cargo check --tests`（无 Linux linker），无法运行
+  Linux 测试二进制，这正是 §1.5 第 3 项能漏到真机的原因；该缺口已由 §5.2 的
+  真机测试与 Debian CI 补齐。
 
 ### 5.2 真实 Crostini 环境
 
@@ -243,3 +244,31 @@
 
 安装、共存、systemd、参数速查、故障排查与卸载见
 [`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)。
+
+### 5.5 v0.3.5-r 清理后的回归验证
+
+历史包袱清理（删除死文件、未用依赖 `drm`、零调用符号与半接线的
+`WmEvent::Shutdown` 分支，统一 CRLF→LF，精简文档、整改 release workflow）
+在同一台 Crostini 真机上重跑：
+
+- `cargo fmt --all -- --check` 通过；`cargo test --workspace --locked`
+  143 个测试（139 + 4）全绿；`cargo build --release --workspace --locked`
+  **0 warning**（此前被 `#[allow(dead_code)]` 掩盖的 9 个警告，按「主线变换
+  API 面」与「bridge getter/setter 对称」两类分别改为带说明的局部 allow，
+  未删除任何主线能力）。
+- `packaging/build-deb.sh` 重建 `sommelier-rs-r_0.3.5-r_amd64.deb`
+  （约 1.3 MiB），`dpkg-shlibdeps` 正常解析出 `libc6 (>= 2.39)`、
+  `libgbm1`、`libgcc-s1`、`libxkbcommon0`，未走兜底；包内目录权限统一 0755，
+  7 份 `docs/*.md` 全部随包分发。
+- `sudo dpkg -i` 从 `0.3.4-r` 原地升级到 `0.3.5-r`；`--help` 中主线兼容参数
+  （`--peer-pid` / `--client-fd` / `--timing-filename` / `--stats-summary` /
+  `--trace-filename` 等）仍全部可解析。
+- 两个 systemd user 模板再次秒级 `active`：Wayland registry 探针的
+  bind / surface / data_device / host 事件全部 PASS、0 协议错误；X11 `:9`
+  的 `Xwayland ready` + `WM initialized` + 真实窗口映射为 host
+  `xdg_toplevel` + RandR 1920x1280 + 剪贴板往返 `wb-e2e-clip-7788` 均通过。
+- 停止后测试单元 `inactive`、无孤儿 `:9` Xwayland / xclip owner，
+  现役 `sommelier@0/1` 始终 `active`。
+
+§5.4 表格第 1 项的 CRLF 兼容补丁已随之移除：历史 CRLF 文件统一为 LF，
+并用 `.gitattributes` 固定，`build-deb.sh` 恢复严格版本匹配。

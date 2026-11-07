@@ -274,11 +274,8 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 BufferState {
                     pool: pool.clone(),
                     offset,
-                    width,
                     height,
                     stride: stride as u32,
-                    format,
-                    host_buffer_id,
                     bo,
                     dmabuf_fd: Some(dmabuf_fd_owned),
                     bo_stride, // Store bo_stride

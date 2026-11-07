@@ -1,5 +1,7 @@
-# main ↔ virtwl 分支合并分析（sommelier-rs-r 的基础）
+# main ↔ virtwl 分支合并决策记录（历史文档）
 
+> **历史文档**：记录合并当时的取舍依据，当前状态见 §5。
+>
 > 本文记录 `sommelier-rs` 两条分支 **逐文件 diff** 的结论，以及合并时的取舍。
 > 基线：`main = e566da7`（`protocol: Add fractional_scale_v1`），
 > `origin/virtwl = 922575c`（`Add systemd user service for sommelioer-rs for virtwl (#24)`）。
@@ -10,7 +12,7 @@
 | | main | virtwl |
 |---|---|---|
 | 传输后端 | virtio-gpu **cross-domain**（`virtgpu_channel.rs`，1445 行，靠 `/dev/dri/renderD*` 的 `CAPSET_CROSS_DOMAIN`） | **virtio_wl** `/dev/wl0`（`virtwl.rs` + `virtwl_channel.rs`） |
-| ChromeOS 能否启动 | ❌ `VirtGpuChannel::new()` 找不到带 cross-domain capset 的 DRM 设备 → `Failed to connect to virtgpu` → 每个 client 连上即被丢弃 | ✅ |
+| ChromeOS 能否启动 | ❌ `VirtGpuChannel::new_with_device()` 找不到带 cross-domain capset 的 DRM 设备 → `Failed to connect to virtgpu` → 每个 client 连上即被丢弃 | ✅ |
 | ChromeOS 专属协议 | ❌ 无 `zaura_shell`、`zcr_keyboard_extension_v1`、`zwp_text_input_v1` / `zcr_text_input_extension_v1` | ✅ 含 shelf app-id、系统快捷键 ack-key、cros-im 输入法 |
 | keyboard / seat / text-input handler | ❌ 全透传 | ✅ 1250 + 566 + 35 行真实逻辑 |
 | `--virtio-wl` CLI | ❌ | ✅ |
@@ -56,10 +58,10 @@
 | `sommelier/build.rs` | **取并集 + 扩展** | 11 个原有协议 + 22 个新增协议，改由单一清单驱动 |
 | `sommelier/Cargo.toml` | **取并集** | `gbm`/`xkbcommon`（virtwl）+ `x11rb`（新 X11 子系统）；版本统一 |
 | `Cargo.toml` / `.gitignore` / `CONTRIBUTING.md` | 保留 virtwl 版 | 无实质冲突 |
-| `docs/ARCHITECTURE.md` | **从 main 恢复为 `ARCHITECTURE_BASELINE.md`** | virtwl 删掉了它；本项目保留为架构基线，实现说明改由 `docs/FEATURE_MATRIX.md` 维护 |
-| `.github/workflows/ci-debian.yaml`, `release-debian.yaml` | **从 main 恢复** | virtwl 删掉的 Debian 打包 CI |
-| `.github/workflows/ci.yaml`, `release.yaml`, `packaging/systemd/*`, `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` | **保留 virtwl** | ChromeOS 部署与快捷键文档 |
-| `accelerator.rs`, `handler/{keyboard,seat,text_input}.rs`, `bin.rs`, `test_xkb.rs` | **保留 virtwl** | ChromeOS 独占能力 |
+| `docs/ARCHITECTURE.md` | **重写为当前架构文档** | 合并期曾保留上游 main 的原始底稿，现已删除；当前结构由 `ARCHITECTURE.md` 维护，完成度由 `FEATURE_MATRIX.md` 维护 |
+| `.github/workflows/ci-debian.yaml`, `release-debian.yaml` | **保留并整改** | Debian 13 CI 与 `.deb` 发布；release 现调用 `packaging/build-deb.sh` 产出 `.deb` |
+| `packaging/systemd/*`, `docs/KEYBOARD_SHORTCUT_INHIBITION.md` | **保留 virtwl** | ChromeOS 部署单元与 Exo 快捷键机制设计说明 |
+| `accelerator.rs`, `handler/{keyboard,seat,text_input}.rs` | **保留 virtwl** | ChromeOS 独占能力；早期的 xkb 实验文件已删除 |
 | `third_party/protocols/*.xml` | **取并集** | 两分支共有的 7 个 + virtwl 独有的 4 个 ChromeOS 协议 + 从主线 sommelier/wayland-protocols 补入的 22 个 |
 
 ## 3. 合并中顺带修掉的既有缺陷
@@ -84,61 +86,10 @@
 - 主线 CLI / `SOMMELIER_*` 环境变量兼容：见 `src/config.rs`
 - 缺失的 Wayland 协议覆盖：见 `docs/FEATURE_MATRIX.md`
 
-## 5. 合并执行结果（验收）
+## 5. 当前状态
 
-上述策略已全部落地，最终状态：
-
-| 项目 | 结果 |
-|---|---|
-| 工程目录 | `sommelier-rs-r/`，binary 名 `sommelier-rs-r`，版本 `0.3.4-r` |
-| 传输层 | `ConnectionTransport` 三变体 + `Config::resolve_transport` / `validate_transport` |
-| 协议 | 33 个 XML 由 `build.rs` 自动枚举，生成 33 个模块 + `protocols::all` 聚合分发 |
-| X11 | `x11/{mod,bridge,atoms,xwayland,wm,clipboard,selection}.rs` 七个模块，`main.rs` 条件启动 |
-| 缩放 | `transform.rs` 经 `handler/output.rs` 接入 `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件；`handler/viewport.rs` 换算 `wp_viewport` 目标尺寸 |
-| 剪贴板 | `x11/selection.rs` 三向桥接：X11 owner → guest `wl_data_offer` + host `wl_data_source` / `set_selection`；host `send` 与 guest `receive` 均由 `ConvertSelection` 异步回写 fd；Wayland offer / source → TARGETS + X11 `SelectionRequest` + 夺回 CLIPBOARD owner。见 [`CLIPBOARD.md`](CLIPBOARD.md) |
-| CLI | `config.rs` 统一 clap + `SOMMELIER_*`，`main.rs` 完成 X11 启动、子进程、sd_notify 接线 |
-| 打包 | systemd unit 与 Debian release workflow 已改为新 binary 名 |
-| 编译 | `cargo check` 与 `cargo check --tests`（`x86_64-unknown-linux-gnu`）均 0 error / 0 warning |
-
-### 合并后又补完的第二轮（tag `v0.3.0-r`）
-
-基线 tag `v0.3.0-r-merge-baseline` 之后继续补齐了功能矩阵中列出的缺口：
-
-1. `preferred_scale` 改为主线严格等价的 `round(wire_scale / scale)`（保留 1/120 精度）。
-2. `--no-support-damage-buffer` 真正生效：`wl_compositor` global / bind 钳制到 v3，
-   并把违规 `damage_buffer` 请求改写成缩放后的 `wl_surface.damage`。
-3. 聚合分发层把 10 个纯内部协议标记为 internal-only，杜绝 host 对象 id 注入 guest。
-4. X11 ↔ Wayland 剪贴板双向桥接（见上表），含延迟 `SelectionRequest` 与 INCR 收发。
-5. `--frame-color` / `--dark-frame-color` 边框绘制、
-   `--allow-xwayland-emulate-screen-pos-size` RandR 模拟、
-   `--viewport-resize` per-surface 缩放注入。
-6. Debian CI 增加 `cargo test --workspace`、全目标 `cargo check --tests`、
-   `cargo fmt --check`。
-
-### 第三轮（tag `v0.3.1-r`）：剪贴板对齐主线
-
-复核主线 C++ 源码后确认：`sommelier.cc` 的 `sl_set_selection()` /
-`sl_get_selection_targets()` / `sl_begin_data_source_send()` 本来就有完整的
-X11 ↔ host 双向剪贴板。第二轮只做到「X11 ↔ guest Wayland」，把 X11 内容合
-成成了 guest `wl_data_offer`，而主线是合成 **host** `wl_data_source`；当时以
-「缺真机验证」为由不实现 host 导出也不成立，主线本身就是可照抄的规格。
-本轮补齐：
-
-1. `registry.rs` 在 Xwayland 连接内部绑定 host `wl_data_device_manager`；
-   `selection.rs::ensure_host_selection_device()` 从 guest 的
-   `get_data_device` 反查 host seat 并创建内部 `wl_data_device`。
-2. X11 TARGETS → `create_data_source` / `offer(mime)`* /
-   `set_selection(source, host_serial)`；host `wl_data_source.send` →
-   `ConvertSelection` → 写回 host fd。owner 清空时发 `set_selection(0, ..)`。
-3. `Context::internal_selection_ids` 在 `proxy.rs` 隔离所有内部 host 对象的
-   事件，避免污染 guest；`on_host_selection()` 过滤 selection 回声。
-4. host / guest Wayland 复制时 `ClipboardBridge::claim_clipboard()` 夺回 X11
-   CLIPBOARD owner（主线 `sl_set_selection` 行为）。
-5. `maybe_update_host_serial()` 从 host 输入事件提取 serial；修正了一个旧测试
-   与按 target 缓存语义不一致、会在 Linux CI 上失败的问题。
-
-逐项完成度、剩余限制与 135 个单元测试的编译情况见
-[`docs/FEATURE_MATRIX.md`](FEATURE_MATRIX.md)；主线对照见
-[`docs/CLIPBOARD.md`](CLIPBOARD.md)。需要特别说明的是：
-**本环境为 Windows 主机，只能做交叉类型检查；Linux 测试二进制由 Debian CI
-执行，仍未在真实 Crostini 设备上跑过 `-X` 启动流程。**
+上表的合并决策已全部落地。本文记录的是**当时的取舍依据**，不是当前实现
+说明：架构见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，逐项完成度见
+[`FEATURE_MATRIX.md`](FEATURE_MATRIX.md)，与主线 C++ 的对齐情况与真机验证见
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md)，安装与打包见
+[`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)。

@@ -80,14 +80,13 @@ impl HostId {
 // `ctx.host_*_id` field, and we register it with `track_host_interface`
 // so proxy.rs can dispatch inbound host events without any magic number hackery.
 
-#[allow(dead_code)]
 pub struct ShadowTable {
     guest_to_host: HashMap<u32, u32>,
     host_to_guest: HashMap<u32, u32>,
     interfaces: HashMap<u32, String>,
     host_interfaces: HashMap<u32, String>,
     next_host_id: u32,
-    /// Restored from `main`: IDs for objects the *host* creates on its own
+    /// IDs for objects the *host* creates on its own
     /// (e.g. `wl_data_device.data_offer`). They live above 0xff000000 so they
     /// can never collide with guest-allocated IDs.
     next_guest_server_id: u32,
@@ -109,11 +108,10 @@ impl ShadowTable {
 
     /// Allocate an ID in the guest namespace for an object created by the host.
     ///
-    /// Restored from `main` (the `virtwl` branch dropped it). Wayland object IDs
-    /// are connection-local: a `new_id` arriving in a host→client event is a
-    /// *host* ID and must never be handed to the guest verbatim. The generator
-    /// now calls this for every event `new_id`; `data_device.rs` keeps its
-    /// explicit hand-written path for `wl_data_offer`.
+    /// Wayland object IDs are connection-local: a `new_id` arriving in a
+    /// host→client event is a *host* ID and must never be handed to the guest
+    /// verbatim. The generator calls this for every event `new_id`;
+    /// `data_device.rs` keeps an explicit hand-written path for `wl_data_offer`.
     pub fn allocate_guest_server_id(&mut self) -> u32 {
         let id = self.next_guest_server_id;
         self.next_guest_server_id = self.next_guest_server_id.wrapping_add(1);
@@ -229,7 +227,6 @@ impl ShadowTable {
         self.interfaces.remove(&guest_id);
     }
 
-    #[allow(dead_code)]
     pub fn find_by_interface(&self, interface_name: &str) -> Vec<u32> {
         self.interfaces
             .iter()
@@ -282,29 +279,24 @@ impl Drop for PoolState {
 }
 
 /// Keeps the backing storage of a host buffer alive for as long as the
-/// `BufferState` exists. Unifies the three allocation strategies that were
-/// split across the two upstream branches.
+/// `BufferState` exists. The payload is intentionally never read: holding the
+/// GBM BO / sealed memfd open is the whole point (dropping it would invalidate
+/// the host handle).
 #[allow(dead_code)]
 pub enum BufferBacking {
-    /// GBM BO (virtwl branch, needs a render node).
+    /// GBM BO (requires a render node).
     Gbm(gbm::BufferObject<()>),
-    /// Sealed memfd (main branch, no /dev/dri dependency).
+    /// Sealed memfd (no `/dev/dri` dependency).
     Memfd(OwnedFd),
-    /// virtio-gpu cross-domain blob (main branch).
-    VirtGpuBlob(OwnedFd),
 }
 
 pub struct BufferState {
     pub pool: Arc<PoolState>,
     pub offset: i32,
-    #[allow(dead_code)]
-    pub width: i32,
     pub height: i32,
     pub stride: u32,
-    #[allow(dead_code)]
-    pub format: u32,
-    #[allow(dead_code)]
-    pub host_buffer_id: u32,
+    // RAII: these own the backing storage / dmabuf fd. They are never read
+    // after construction, but dropping them early invalidates the host handle.
     #[allow(dead_code)]
     pub bo: Option<BufferBacking>,
     #[allow(dead_code)]
@@ -374,10 +366,9 @@ pub struct Context {
     /// Pending messages to send from host→client (e.g. synthetic wl_shm.format).
     pub host_to_client_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
     pub allocator: Option<Allocator>,
-    /// virtio_wl backend (Crostini). Restored alongside `virtgpu_channel` so a
-    /// single binary can serve both kinds of VMM.
+    /// virtio_wl backend (Crostini).
     pub virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
-    /// virtio-gpu cross-domain backend (crosvm / generic VMM), from `main`.
+    /// virtio-gpu cross-domain backend (crosvm / generic VMM).
     pub virtgpu_channel: Option<Arc<Mutex<VirtGpuChannel>>>,
     pub host_dmabuf_id: Option<u32>,
     pub host_shm_id: Option<u32>,

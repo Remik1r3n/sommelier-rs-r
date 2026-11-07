@@ -207,8 +207,8 @@ pub struct AtomTable {
     values: HashMap<Atom, u32>,
 }
 
-// Some lookup helpers are only used by diagnostics/tests today; keep the
-// full table API available for the selection bridge.
+// `name_of` is only used by the selection bridge's diagnostics and unit
+// tests; keep the table API complete.
 #[allow(dead_code)]
 impl AtomTable {
     pub fn new() -> Self {
@@ -253,12 +253,6 @@ impl AtomTable {
             .iter()
             .find(|(_, v)| **v == value)
             .map(|(a, _)| a.name())
-    }
-
-    /// Number of resolved atoms (useful for diagnostics/tests).
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.values.len()
     }
 
     pub fn is_empty(&self) -> bool {

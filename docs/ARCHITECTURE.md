@@ -1,9 +1,9 @@
 # sommelier-rs-r 架构
 
-本文描述**当前代码**的结构。`docs/ARCHITECTURE_BASELINE.md` 是上游 `main`
-分支的原始架构底稿，仅作合并参考；两分支的逐文件对比见
+本文描述**当前代码**的结构。两分支合并时的逐文件决策见
 [`BRANCH_MERGE.md`](BRANCH_MERGE.md)，功能完成度见
-[`FEATURE_MATRIX.md`](FEATURE_MATRIX.md)。
+[`FEATURE_MATRIX.md`](FEATURE_MATRIX.md)，与主线 C++ `sommelier` 的逐项对照见
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md)。
 
 ## 1. 角色与边界
 
@@ -203,9 +203,12 @@ sequenceDiagram
 
 `transform.rs` 实现主线三坐标系（Physical / Virtual / Host Logical）、
 `wl_fixed` 24.8 定点运算、DPI 桶与三种 scaling mode。`handler/output.rs`
-拦截 `wl_output.geometry/mode/scale`、`zxdg_output_v1.logical_*`、
+拦截 `wl_output.geometry/mode/scale` 与
 `wp_fractional_scale_v1.preferred_scale`，按虚拟坐标系重写，并把输出布局
 同步回 `Transform` 与 `X11Bridge`（供 RandR 模拟）。
+`zxdg_output_manager_v1` 不向 guest 公布、也不在 host 侧内部 bind，因此
+`zxdg_output_v1.logical_*` handler 保留但不会触发；direct 模式直接用
+`wl_output` 几何换算，见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
 
 `--no-support-damage-buffer` 把 `wl_compositor` 钳制到 v3，并把违规
 `damage_buffer` 请求改写成缩放后的 `wl_surface.damage`。

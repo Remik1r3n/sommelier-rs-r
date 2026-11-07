@@ -29,17 +29,17 @@ ls -l /opt/google/cros-containers/bin/Xwayland   # 用 -X 时需要
 ## 1. 把 `.deb` 放进容器
 
 包名格式：`sommelier-rs-r_<版本>_amd64.deb`，例如
-`sommelier-rs-r_0.3.4-r_amd64.deb`。
+`sommelier-rs-r_0.3.5-r_amd64.deb`。
 
 三种方式任选：
 
 ```bash
 # A. 从 ChromeOS「文件」应用把 .deb 放进 Linux 文件 / MyFiles/Downloads
-sudo dpkg -i /mnt/chromeos/MyFiles/Downloads/sommelier-rs-r_0.3.4-r_amd64.deb
+sudo dpkg -i /mnt/chromeos/MyFiles/Downloads/sommelier-rs-r_0.3.5-r_amd64.deb
 
 # B. 从别的机器 scp 进来（把地址换成你的容器地址）
-scp -P 22122 sommelier-rs-r_0.3.4-r_amd64.deb remik1r3n@10.0.0.106:~/
-sudo dpkg -i ~/sommelier-rs-r_0.3.4-r_amd64.deb
+scp -P <port> sommelier-rs-r_0.3.5-r_amd64.deb <user>@<container-ip>:~/
+sudo dpkg -i ~/sommelier-rs-r_0.3.5-r_amd64.deb
 
 # C. 直接在容器里从源码重建（见 §10）
 bash packaging/build-deb.sh
@@ -65,7 +65,7 @@ sudo apt-get -f install -y
 确认安装结果：
 
 ```bash
-sommelier-rs-r --version        # 0.3.4-r
+sommelier-rs-r --version        # 0.3.5-r
 dpkg -L sommelier-rs-r          # 查看装了哪些文件
 sommelier-rs-r --help | head -20
 ```
@@ -301,7 +301,7 @@ sommelier-rs-r --transport=virtgpu --force-drm-device=/dev/dri/renderD128 --sock
 **目前不建议在生产使用习惯里直接替换**，原因见
 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4：
 `--peer-pid` / `--client-fd` 的 parent/child fd 传递、`wl_drm` 本地模拟、
-完整 `--viewport-resize`、stylus→tablet 转换、Perfetto/stats 等还未 1:1 对齐。
+`--viewport-resize` 的指针补偿、stylus→tablet 转换、Perfetto/stats 等还未 1:1 对齐。
 真机上现役主线实例确实在被 QQ / VSCode 用 `--peer-pid --client-fd` 调用。
 
 如果只是想试，流程是：
@@ -387,29 +387,13 @@ sudo dpkg -P sommelier-rs-r     # 彻底清除
 
 ---
 
-## 13. 真机验证记录（v0.3.3-r / v0.3.4-r）
+## 13. 验证状态
 
-在 Debian 13 trixie / penguin / `/dev/wl0` / 主线 sommelier 0.20 并存的环境下，
-全程用 `--socket=wayland-wb`、`--x-display=9` 完成：
+Wayland / X11 主链路与 `.deb` 安装均已在 Debian 13 / `penguin` / `/dev/wl0`
+真机端到端验证（143 个单元测试全绿、22 个 host globals、Xwayland `:9`
+真实窗口、剪贴板往返、两个 systemd user 模板秒级 `active`），逐项记录见
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.2 / §5.4。
 
-- 143 个单元测试通过、`cargo fmt --check` 与 release 构建通过；
-- Wayland：22 个 host global、0 协议错误；`wl_compositor v4`、`wl_output v3`、
-  `wl_seat v5`、`wl_data_device_manager v3`、`xdg_wm_base v3` 全部命中主线版本钳制；
-  `bind` / `create_surface` / `get_data_device` 正常，host 的
-  `geometry(0,0)`、`mode 1920x1280@60`、`scale 2`、`done`、seat capabilities 完整转发；
-- X11：`Xwayland 1.20.14` 在 `:9` 就绪、WM 初始化、`_NET_SUPPORTED` 前 8 个 atom
-  与主线一致、RandR 模拟生效；真实 `xmessage` 窗口映射到 host `xdg_toplevel`；
-  剪贴板往返成功；guest Wayland 客户端同时收到 `data_offer` / `selection`；
-- 测试结束后现役 `wayland-0/1`、`:0/:1` 完好，测试用 `:9` 无残留。
-
-**`v0.3.4-r` 安装包本身**：`sudo dpkg -i` 在真机通过，
-`/usr/bin/sommelier-rs-r --version` = `0.3.4-r`；随包的
-`sommelier-rs-r@wayland-wb.service` 与 `sommelier-rs-r-x@wayland-wbx.service`
-两个模板都实测秒级 `active`（registry 22 globals / 0 错误、Xwayland `:9`
-ready、WM initialized、剪贴板往返 `readback=unit-clip-3401`）；安装前后现役
-`sommelier@0/1` 始终 `active`。打包过程中的 3 个真机问题与修复见
-[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.4。
-
-未覆盖：ChromeOS host 侧人工「粘贴」、用 `--peer-pid/--client-fd` 顶替现役实例、
-长时间稳定性、真实 GPU 加速路径。完整对照见
-[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4 / §5。
+未覆盖：ChromeOS host 侧人工粘贴、`--peer-pid`/`--client-fd` 顶替现役实例、
+长时间稳定性、真实 GPU 加速路径。完整差距见
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。

@@ -74,11 +74,10 @@ impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {
 
 impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {
     /// `wl_data_device.data_offer` carries a `new_id` that the *host* allocated.
-    /// Restored from `main`: hand the guest a fresh id from the server range
-    /// instead of leaking the host id into the guest namespace. The codegen now
-    /// does this generically for every event `new_id`; we keep the explicit
-    /// path here so clipboard stays correct even if a protocol is bound with a
-    /// hand-written event path.
+    /// Hand the guest a fresh id from the server range instead of leaking the
+    /// host id into the guest namespace. The codegen does this generically for
+    /// every event `new_id`; the explicit path stays here so clipboard remains
+    /// correct for hand-written event paths too.
     fn on_data_offer(&mut self, ctx: &mut Context, id: u32) -> Action {
         let host_id = id;
         let guest_id = ctx.shadow_table.allocate_guest_server_id();

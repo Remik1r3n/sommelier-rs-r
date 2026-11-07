@@ -152,8 +152,6 @@ pub const VIRTGPU_BLOB_MEM_HOST3D: u32 = 0x0002;
 
 pub const VIRTGPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const VIRTGPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
-#[allow(unused)]
-pub const VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0003;
 
 pub const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 pub const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -389,7 +387,6 @@ impl VirtGpuSender {
         data: &[u8],
         hang_up: bool,
     ) -> Result<(), nix::Error> {
-        // warn!("Sender::send_pipe_data: pipe_id={} len={} hang_up={}", pipe_id, data.len(), hang_up);
         let mut cmd = CrossDomainReadWrite::new_zeroed();
         cmd.hdr.cmd = CROSS_DOMAIN_CMD_WRITE;
         cmd.hdr.cmd_size = (std::mem::size_of::<CrossDomainReadWrite>() + data.len()) as u16;
@@ -441,50 +438,7 @@ impl VirtGpuChannel {
         Ok(s.trim_matches(char::from(0)).to_string())
     }
 
-    #[allow(dead_code)]
-    pub fn get_resource_info(&self, fd: RawFd) -> Result<DrmVirtgpuResourceInfo, nix::Error> {
-        let mut prime = DrmPrimeFdToHandle {
-            fd,
-            flags: 0,
-            handle: 0,
-        };
-
-        unsafe {
-            drm_prime_fd_to_handle(self.file.get_ref().as_raw_fd(), &mut prime)?;
-        }
-
-        let mut info = DrmVirtgpuResourceInfo::new_zeroed();
-        info.bo_handle = prime.handle;
-
-        let res = unsafe { virtgpu_resource_info(self.file.get_ref().as_raw_fd(), &mut info) };
-
-        // Always close handle
-        let mut close = DrmGemClose {
-            handle: prime.handle,
-            pad: 0,
-        };
-        unsafe {
-            let _ = drm_gem_close(self.file.get_ref().as_raw_fd(), &mut close);
-        }
-
-        res?;
-        Ok(info)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_device_id(&self) -> Result<u64, nix::Error> {
-        let stat = fstat(self.file.get_ref())?;
-        Ok(stat.st_rdev)
-    }
-
     /// Opens a virtio-gpu device and verifies it supports cross-domain contexts.
-    /// Convenience wrapper kept for API compatibility with upstream `main`;
-    /// the proxy calls [`Self::new_with_device`] so `--force-drm-device` works.
-    #[allow(dead_code)]
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_device(None)
-    }
-
     /// `forced` implements mainline `--force-drm-device=PATH`: probe exactly
     /// that render node instead of enumerating `/dev/dri/renderD128..191`.
     pub fn new_with_device(forced: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
@@ -564,13 +518,13 @@ impl VirtGpuChannel {
         let caps = Self::get_caps(file, CAPSET_CROSS_DOMAIN)?;
 
         if (caps.supported_channels & CROSS_DOMAIN_CHANNEL_TYPE_WAYLAND) == 0 {
-            // debug!("  Missing CROSS_DOMAIN_CHANNEL_TYPE_WAYLAND (supported: {:x})", caps.supported_channels);
-            // return Ok(false);
+            // Crostini hosts may omit this capability bit even though the
+            // Wayland channel works (the C++ sommelier relies on it too), so
+            // warn and keep probing instead of rejecting the device.
             warn!(
-                "  Host reports missing Wayland support (supported: {:x})",
+                "host reports no CROSS_DOMAIN_CHANNEL_TYPE_WAYLAND (supported: {:x}); continuing",
                 caps.supported_channels
             );
-            warn!("  IGNORING CHECK because C++ sommelier works.");
         }
 
         Ok(true)
@@ -1342,11 +1296,6 @@ pub fn spawn_virtgpu_actor(
                                          let sender = VirtGpuSender { file: file_clone };
 
                                          let handle = tokio::spawn(async move {
-                                             // read_fd_raw is actually OwnedFd based on the error message?
-                                             // Or did I misread the error? "expected `i32`, found `OwnedFd`"
-                                             // This usually means the function expected i32, but got OwnedFd.
-                                             // `OwnedFd::from_raw_fd` expects `RawFd` (i32).
-                                             // So `read_fd_raw` MUST be `OwnedFd`.
                                              let read_fd = read_fd_raw;
 
                                              // Set O_NONBLOCK

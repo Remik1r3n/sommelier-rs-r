@@ -565,10 +565,6 @@ fn apply_property(
 
 #[derive(Debug)]
 struct XWindow {
-    /// The client XID; retained for diagnostics and the clipboard/selection
-    /// bridge even though window lookup currently keys on `frame_id`.
-    #[allow(dead_code)]
-    xid: u32,
     frame_id: u32,
     info: X11WindowInfo,
     managed: bool,
@@ -591,7 +587,6 @@ struct XWindow {
 impl XWindow {
     fn new(xid: u32) -> Self {
         Self {
-            xid,
             frame_id: 0,
             info: X11WindowInfo {
                 xid,
@@ -633,7 +628,6 @@ struct WmState {
     /// Atom named by `--application-id-x11-property`, interned in `init`.
     app_id_property_atom: u32,
     shape_enabled: bool,
-    quit: bool,
     /// `--allow-xwayland-emulate-screen-pos-size` (RandR emulation).
     allow_randr_emu: bool,
     last_output_rects_gen: u64,
@@ -659,7 +653,6 @@ impl WmState {
             application_id: opts.application_id.clone(),
             app_id_property_atom: 0,
             shape_enabled: opts.enable_xshape,
-            quit: false,
             allow_randr_emu: opts.allow_randr_emu,
             last_output_rects_gen: 0,
             frame_color: parse_frame_color(&opts.frame_color),
@@ -1557,10 +1550,6 @@ impl WmState {
                 self.clipboard
                     .request_target(conn, &atoms_snapshot, &target);
             }
-            WmEvent::Shutdown => {
-                info!("x11: WM thread shutting down");
-                self.quit = true;
-            }
         }
         // A ClipboardData event may unblock SelectionRequests that were held
         // while the proxy fetched their payload.
@@ -1636,9 +1625,6 @@ pub fn run<C>(
     state.init(&conn, &bridge, &opts);
 
     loop {
-        if state.quit {
-            break;
-        }
         match conn.poll_for_event() {
             Ok(Some(ev)) => state.handle_event(&conn, &bridge, ev),
             Ok(None) => {}
@@ -1650,12 +1636,6 @@ pub fn run<C>(
 
         while let Some(ev) = bridge.try_recv_event() {
             state.handle_wm_event(&conn, &bridge, ev);
-            if state.quit {
-                break;
-            }
-        }
-        if state.quit {
-            break;
         }
 
         state.retry_pending_surfaces(&bridge);

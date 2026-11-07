@@ -31,14 +31,11 @@ pub struct WaylandConnection {
     pub read_fds: Vec<RawFd>,
 }
 
-/// All three host transports from the two upstream branches coexist here.
+/// The three supported host transports, selected at runtime by `--transport`.
 ///
-/// - `Unix`: local/placeholder mode (main + virtwl), plain socketpair or compositor socket.
-/// - `VirtWayland`: virtio_wl `/dev/wl0`, the only backend that works on ChromeOS Crostini
-///   (from the `virtwl` branch).
-/// - `VirtGpu`: virtio-gpu cross-domain, for crosvm / generic VMMs (from `main`).
-///
-/// Previously each branch hard-coded one of the latter two and deleted the other.
+/// - `Unix`: plain socketpair or a local compositor socket.
+/// - `VirtWayland`: virtio_wl `/dev/wl0`, the backend used on ChromeOS Crostini.
+/// - `VirtGpu`: virtio-gpu cross-domain, for crosvm / generic VMMs.
 enum ConnectionTransport {
     Unix(AsyncFd<OwnedFd>),
     VirtWayland(Arc<VirtWaylandChannel>),
@@ -79,7 +76,7 @@ impl WaylandConnection {
         }
     }
 
-    /// Restored from `main`: virtio-gpu cross-domain host connection.
+    /// virtio-gpu cross-domain host connection.
     pub fn new_virtgpu(channel: Arc<Mutex<VirtGpuChannel>>, initial_fence: OwnedFd) -> Self {
         let (tx, rx) = spawn_virtgpu_actor(channel, initial_fence);
         Self {

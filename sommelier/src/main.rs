@@ -254,5 +254,3 @@ async fn main() {
 
     proxy::run(cfg, bridge, wm_commands, xwayland_client_fd).await;
 }
-
-mod test_xkb;

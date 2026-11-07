@@ -320,11 +320,6 @@ impl SelectionBridge {
         self.bridge = bridge;
     }
 
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        self.bridge.is_some()
-    }
-
     // ----- guest request tracking (client -> host direction) -----
 
     /// `wl_data_device_manager.get_data_device(id, ..)`.

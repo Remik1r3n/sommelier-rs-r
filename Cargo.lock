@@ -597,10 +597,9 @@ dependencies = [
 
 [[package]]
 name = "sommelier"
-version = "0.3.4-r"
+version = "0.3.5-r"
 dependencies = [
  "clap",
- "drm",
  "env_logger",
  "gbm",
  "libc",

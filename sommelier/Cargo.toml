@@ -14,7 +14,7 @@
 
 [package]
 name = "sommelier"
-version = "0.3.4-r"
+version = "0.3.5-r"
 edition = "2021"
 description = "sommelier-rs-r: X11-capable Wayland proxy for ChromeOS Crostini"
 license = "Apache-2.0"
@@ -33,7 +33,6 @@ nix = { version = "0.31", features = [
 tokio = { version = "1.49", features = ["full"] }
 libc = "0.2"
 gbm = { version = "0.16", default-features = false, features = ["drm-support"] }
-drm = "0.14"
 zerocopy = { version = "0.7", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

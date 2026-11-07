@@ -164,6 +164,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xkb_keymap_maps_keysym_to_keycode() {
+        // Smoke test for the xkbcommon keymap API the accelerator parser relies on.
+        use xkbcommon::xkb;
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+
+        let mut found = None;
+        for raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
+            let keycode = raw.into();
+            if keymap
+                .key_get_syms_by_level(keycode, 0, 0)
+                .iter()
+                .any(|s| s.raw() == xkb::keysyms::KEY_a)
+            {
+                found = Some(keycode);
+                break;
+            }
+        }
+        assert!(found.is_some());
+    }
+
+    #[test]
     fn parse_accelerators_standard_list() {
         let list = parse_accelerators("Super_L,<Alt>bracketleft,<ALT>bracketright,<Control>space")
             .unwrap();
