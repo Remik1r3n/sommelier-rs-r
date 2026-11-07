@@ -11,7 +11,8 @@ ChromeOS 专有扩展等）。
 > 分支对比与逐文件合并决策见 [`docs/BRANCH_MERGE.md`](docs/BRANCH_MERGE.md)，
 > 当前架构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，
 > 功能完成度与已知限制见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md)，
-> 剪贴板双向桥接与主线 C++ 实现的逐行对照见 [`docs/CLIPBOARD.md`](docs/CLIPBOARD.md)。
+> 剪贴板双向桥接与主线 C++ 实现的逐行对照见 [`docs/CLIPBOARD.md`](docs/CLIPBOARD.md)，
+> **Crostini 安装与使用（`.deb`）见 [`docs/CROSTINI_INSTALL.md`](docs/CROSTINI_INSTALL.md)**。
 
 ## 与上游的关系
 
@@ -55,7 +56,20 @@ ChromeOS 专有扩展等）。
   生成 `protocols::all` 聚合分发；新增协议只需放入一个 XML。
 - **主线参数兼容**：clap + `SOMMELIER_*` 环境变量，命令行优先于环境变量。
 
-## 在 Crostini 中替换主线 sommelier
+## 在 Crostini 中安装与使用
+
+**最快的方式是直接装 `.deb`**（构建脚本 `packaging/build-deb.sh`，完整步骤见
+[`docs/CROSTINI_INSTALL.md`](docs/CROSTINI_INSTALL.md)）：
+
+```bash
+sudo dpkg -i sommelier-rs-r_0.3.4-r_amd64.deb
+sommelier-rs-r --transport=virtwl --virtio-wl /dev/wl0 --socket=wayland-wb
+WAYLAND_DISPLAY=wayland-wb your-app          # 另一个终端
+```
+
+包只安装一个独立的 `/usr/bin/sommelier-rs-r` 和两个默认不启用的 systemd
+user 模板，**不替换主线 sommelier、不动现役 `wayland-0/1` 与 `:0/:1`**。
+下面的源码编译流程供开发，或用于「真正替换主线」的场景。
 
 ```bash
 # 1. 停掉主线 sommelier（X11 侧服务可按需保留）
@@ -86,8 +100,11 @@ Xwayland 默认路径为 `/opt/google/cros-containers/bin/Xwayland`，可用
 `--xwayland-path` 覆盖。若 Xwayland 启动失败，代理会记录错误并继续只提供
 Wayland 服务，不会整体退出。
 
-systemd 用户单元见 `packaging/systemd/sommelier-rs@.service`，
-在 `[Service]` 的 `ExecStart` 后追加 `-X` 即可启用 X11。
+systemd 用户单元模板：`packaging/systemd/sommelier-rs-r@.service`（Wayland）与
+`sommelier-rs-r-x@.service`（X11，`:9`）；`.deb` 会把它们装到
+`/usr/lib/systemd/user/`，实例名即 guest socket 名，例如
+`systemctl --user start sommelier-rs-r@wayland-wb.service`。
+更多参数与 drop-in 写法见 `docs/CROSTINI_INSTALL.md` §5。
 
 ## 常用参数
 
@@ -144,17 +161,19 @@ sommelier/
   build.rs             枚举 XML → 生成协议模块与聚合分发
 wayland_codegen/       XML 解析 + Rust 代码生成 + aggregate 生成
 third_party/protocols/ 33 个协议 XML
-docs/                  当前架构、剪贴板主线对照、分支合并记录、上游架构基线、功能矩阵
+packaging/             build-deb.sh 与两个 systemd user 单元模板
+docs/                  当前架构、Crostini 安装指南、剪贴板主线对照、分支合并记录、主线一致性对照、功能矩阵
 ```
 
 ## 已知限制
 
 详见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md) §6。最需要注意的三点：
 
-1. **尚未在真实 Crostini 设备上做端到端验证**：开发机是 Windows，只能做
-   `x86_64-unknown-linux-gnu` 交叉类型检查；`cargo test` 已加入 Debian CI
-   （`x86_64` 真机执行），但尚未在 Crostini guest 里跑过 `-X` 启动流程与
-   「X11 复制 → ChromeOS 粘贴」的 host 协议行为。
+1. **ChromeOS host 侧的人工交互尚未验证**：Wayland 与 X11 两条主链路已在
+   Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通（`-X` 启动、真实 X11
+   窗口、剪贴板往返均实测），但「X11 复制 → 在 ChromeOS 界面里粘贴」仍需
+   人工在 host 侧确认；`--peer-pid`/`--client-fd` 顶替现役实例、长时间稳定性
+   与真实 GPU 加速路径也未覆盖。详见 `docs/MAINLINE_PARITY.md` §4 / §5。
 2. **explicit fence / seccomp / `--parent` fork 模型**仍是参数或语义级简化，
    见功能矩阵逐项说明。
 3. **首次复制可能缺 serial**：`wl_data_device.set_selection` 的 serial 取自
@@ -170,6 +189,7 @@ docs/                  当前架构、剪贴板主线对照、分支合并记录
 | `v0.3.1-r` | 按主线补齐 X11 → ChromeOS host 剪贴板导出、host/Wayland 复制夺回 X11 owner、serial 跟踪、内部对象事件隔离 |
 | `v0.3.2-r` | 逐项对照主线消除语义偏差：`--socket`/`--display`/位置参数、global 版本钳制、`gtk_shell1` 桥接、剪贴板 MIME 1:1、X11 app_id、INCR 64 KiB、输出几何、env 与 C 风格数值解析。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) |
 | `v0.3.3-r` | **真实 Crostini 端到端验证**并修复 3 个真机特有问题：字符串 `SOMMELIER_*` env 绑定 bool flag 导致拒绝启动、X11 启动顺序死锁（Xwayland 连不上 Wayland proxy）、一个仅在运行时暴露的测试断言错误。Wayland 与 X11 两条主链路实测打通。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §1.5 / §5 |
+| `v0.3.4-r` | **Debian `.deb` 交付与 Crostini 安装指南**：`packaging/build-deb.sh`（release + strip + `dpkg-shlibdeps` 自动解析依赖 + 两个 systemd user 模板 + 全量文档），`docs/CROSTINI_INSTALL.md` 覆盖安装、与主线共存、Wayland/X11/systemd 三种启动、参数速查、故障排查与卸载；`.deb` 已实机 `dpkg -i` 安装、两个 systemd 单元实测通过；清理上一轮遗留的「未做真机验证」过时表述。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §5.4 |
 
 ## 其他说明
 

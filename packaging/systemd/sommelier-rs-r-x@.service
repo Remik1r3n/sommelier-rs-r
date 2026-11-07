@@ -1,0 +1,18 @@
+[Unit]
+Description=sommelier-rs-r X11/Wayland proxy on socket %i (X display :9)
+Documentation=file:/usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md
+
+[Service]
+Type=notify
+NotifyAccess=all
+# X11 variant: launches Xwayland on :9 and acts as its window manager.
+# Use a DIFFERENT instance name than the Wayland-only unit, otherwise the
+# two services would fight over the same guest socket.
+# Override --x-display with a drop-in if :9 is already taken.
+# --sd-notify is required by Type=notify (READY=1 after the listener is bound).
+ExecStart=/usr/bin/sommelier-rs-r --transport=auto --virtio-wl /dev/wl0 --socket=%i -X --x-display=9 --sd-notify
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

@@ -244,5 +244,6 @@ cargo test --workspace
 ```
 
 Debian 13 CI 覆盖 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、
-全目标 `cargo check --tests` 与格式检查。剩余限制与未做真实设备验证的说明
-见 `FEATURE_MATRIX.md` §6。
+全目标 `cargo check --tests` 与格式检查；此外已在 Crostini 真机跑通 Wayland
+与 X11 端到端，并可由 `packaging/build-deb.sh` 构建 `.deb`（见
+`CROSTINI_INSTALL.md`）。剩余限制见 `FEATURE_MATRIX.md` §6。

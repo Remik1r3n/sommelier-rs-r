@@ -215,3 +215,31 @@
 `--scale` 取整与 `atof`/`atoi` 语义、`--fullscreen-mode` 校验、
 **字符串 env 不再绑定 bool flag**、MIME 1:1 与别名、`normalize_targets` 顺序、
 `gtk_shell1` 桥接、`virtual_x_for_host_x()`、`preferred_scale` 退化分支。
+
+### 5.4 Debian 包交付（v0.3.4-r）
+
+`packaging/build-deb.sh` 在同一台 Crostini 真机上执行
+`cargo build --release --workspace --locked`（首次 53 s）→ strip →
+`dpkg-shlibdeps` 解析运行时依赖 → `dpkg-deb --build --root-owner-group -Zxz`。
+产物 `sommelier-rs-r_0.3.4-r_amd64.deb`（约 1.3 MiB），依赖解析为
+`libc6 (>= 2.39)`, `libgbm1`, `libgcc-s1`, `libxkbcommon0`（`libdrm2` /
+`libexpat1` 由 `libgbm1` 传递引入）。
+
+- `sudo dpkg -i` 实机安装通过；`/usr/bin/sommelier-rs-r --version` = `0.3.4-r`；
+  安装前后现役 `sommelier@0/1` 始终 `active`，`wayland-0/1` 与 `:0/:1` 未变
+- 随包两个 systemd user 模板实测：`sommelier-rs-r@wayland-wb.service` 与
+  `sommelier-rs-r-x@wayland-wbx.service` 均秒级 `active`；前者 registry
+  22 globals / 0 错误，后者 `Xwayland ready` + `WM initialized` +
+  `1920x1280` + 剪贴板往返成功；停止后测试单元 `inactive`、现役单元仍 `active`
+- 143 个单元测试在 `0.3.4-r` 树上再次全绿，`cargo fmt --all -- --check` 通过
+
+**打包过程本身又暴露并修掉 3 个只有真机才能发现的问题**：
+
+| # | 现象 | 根因 / 修复 |
+|---|---|---|
+| 1 | 脚本读不出版本并 die | `sommelier/Cargo.toml` 是历史 CRLF 文件，`sed 's/^version = "\(.*\)"$/\1/p'` 因行尾 `\r` 不匹配 → 改为 `'s/^version = "\([^"]*\)".*/\1/p'` |
+| 2 | 包内目录权限是 `drwxrwxr-x` | `dpkg-deb` 原样记录 staging 目录的 umask 权限 → 打包前 `find "$STAGE" -type d -exec chmod 0755 {} +` |
+| 3 | `systemctl --user start` 卡 90 s 超时、服务被 kill（`activating (auto-restart) (Result: timeout)`），但进程实际已在工作 | 单元是 `Type=notify`，而 `proxy::run` 只在 `cfg.sd_notify` 为真时发 `READY=1`；改写单元时漏了裸 `--sd-notify` → 两个 `ExecStart` 补回该参数，并在 `CROSTINI_INSTALL.md` §5 / §11 明确写出「覆盖 `ExecStart` 必须保留 `--sd-notify`」 |
+
+安装、共存、systemd、参数速查、故障排查与卸载见
+[`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)。

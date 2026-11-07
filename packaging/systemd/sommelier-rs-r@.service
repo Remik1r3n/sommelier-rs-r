@@ -1,0 +1,20 @@
+[Unit]
+Description=sommelier-rs-r Wayland proxy on socket %i
+Documentation=file:/usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md
+
+[Service]
+Type=notify
+NotifyAccess=all
+# %i is the guest socket name. Keep it distinct from the live upstream
+# sockets (wayland-0 / wayland-1); e.g. sommelier-rs-r@wayland-wb.service.
+# --socket is the guest listener; --display (unused here) would be the host.
+# SOMMELIER_* variables from the user manager are inherited; use
+# `systemctl --user set-environment NAME=VALUE` or a drop-in Environment=.
+# --sd-notify makes proxy::run send READY=1 after the listener is bound;
+# without it Type=notify would wait forever and systemd would kill the unit.
+ExecStart=/usr/bin/sommelier-rs-r --transport=auto --virtio-wl /dev/wl0 --socket=%i --sd-notify
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

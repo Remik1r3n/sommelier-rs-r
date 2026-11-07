@@ -128,10 +128,11 @@
 > host 侧合成 source，方向不对。现按主线语义实现，逐行对照与链路图见
 > [`docs/CLIPBOARD.md`](CLIPBOARD.md)。
 
-1. **未在真实 Crostini 设备上做端到端验证。** 开发机为 Windows 主机，只能做
-   `x86_64-unknown-linux-gnu` 交叉类型检查。`cargo test` 已加入 Debian CI
-   （x86_64 runner 真机执行），但 `-X` 启动流程与「X11 应用复制 → ChromeOS
-   粘贴」的 host 协议行为仍需在 Crostini guest 内确认。
+1. **ChromeOS host 侧的人工交互尚未验证。** Wayland 与 X11 两条主链路已在
+   Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通（见 §7 与
+   [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5），但「X11 应用复制 → 在
+   ChromeOS 界面里粘贴」需要人工在 host 侧确认；用 `--peer-pid`/`--client-fd`
+   顶替现役实例、长时间稳定性与真实 GPU 加速路径同样未覆盖。
 2. **explicit fence**：`--explicit-fence` 与
    `zwp_linux_explicit_synchronization_v1` XML 就绪，但未接入
    `linux_explicit_synchronization` 的 fence 收发逻辑；该协议目前按内部
@@ -164,7 +165,8 @@
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
 | Rust 源码规模 | 19,283 行（`sommelier/src` + `wayland_codegen/src`） |
 | 真机端到端 | **已验证**：virtwl → host globals/事件、guest registry 与版本钳制、`gtk_shell1`/text-input-v3 synthetic global、Xwayland `:9` 启动、WM 管理真实 X11 窗口并映射为 host `xdg_toplevel`、RandR 模拟、X11 ↔ guest 剪贴板往返、键盘焦点。详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5 |
-| 真实设备运行 | ❌ 未执行，见 §6.1 |
+| 真实设备运行 | ✅ 已在 Debian 13 / `penguin` / `/dev/wl0` 真机运行（独立 `wayland-wb` / `:9`，现役 `wayland-0/1`、`:0/:1` 未受影响）；仍未覆盖 host 侧人工交互，见 §6 第 1 项 |
+| Debian `.deb` 交付 | ✅ `packaging/build-deb.sh` 在真机上构建 `sommelier-rs-r_0.3.4-r_amd64.deb`（release + strip + `dpkg-shlibdeps` 解析依赖），随包附带两个 disabled-by-default systemd user 模板与全量文档；已实机 `dpkg -i` 安装并验证两个单元均秒级 `active`。安装与使用见 [`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)，打包验证见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.4 |
 
 ### 合并过程中修掉的既有缺陷
 
@@ -173,7 +175,7 @@
 3. `last_sender_id` 方向混用 → 增加方向专用字段，旧字段保持兼容；
 4. `--virtgpu-channel` 是死参数 → 真正接入 `connect_host()`；
 5. `VirtGpuChannel::new()` / `Allocator::new()` 不支持指定设备 → `new_with_device` / `with_device`；
-6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.3-r`）；
+6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.4-r`）；
 7. `virtwl` 的 `&String` handler 参数 → 回退为 `&str`；
 8. `WaylandConnection::new` 未设 `O_NONBLOCK`（virtwl 修复，已保留）；
 9. EOF 误断连（main 修复，已回补）。
