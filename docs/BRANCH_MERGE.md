@@ -93,13 +93,29 @@
 | 工程目录 | `sommelier-rs-r/`，binary 名 `sommelier-rs-r`，版本 `0.3.0-r` |
 | 传输层 | `ConnectionTransport` 三变体 + `Config::resolve_transport` / `validate_transport` |
 | 协议 | 33 个 XML 由 `build.rs` 自动枚举，生成 33 个模块 + `protocols::all` 聚合分发 |
-| X11 | `x11/{mod,bridge,atoms,xwayland,wm,clipboard}.rs` 六个模块，`main.rs` 条件启动 |
-| 缩放 | `transform.rs` 经 `handler/output.rs` 接入 `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件 |
+| X11 | `x11/{mod,bridge,atoms,xwayland,wm,clipboard,selection}.rs` 七个模块，`main.rs` 条件启动 |
+| 缩放 | `transform.rs` 经 `handler/output.rs` 接入 `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件；`handler/viewport.rs` 换算 `wp_viewport` 目标尺寸 |
+| 剪贴板 | `x11/selection.rs` 双向桥接：X11 owner → guest offer / `ConvertSelection` → fd；Wayland offer / source → TARGETS + X11 `SelectionRequest` |
 | CLI | `config.rs` 统一 clap + `SOMMELIER_*`，`main.rs` 完成 X11 启动、子进程、sd_notify 接线 |
 | 打包 | systemd unit 与 Debian release workflow 已改为新 binary 名 |
 | 编译 | `cargo check` 与 `cargo check --tests`（`x86_64-unknown-linux-gnu`）均 0 error / 0 warning |
 
-逐项完成度、剩余限制与 108 个单元测试的编译情况见
+### 合并后又补完的第二轮（tag `v0.3.0-r`）
+
+基线 tag `v0.3.0-r-merge-baseline` 之后继续补齐了功能矩阵中列出的缺口：
+
+1. `preferred_scale` 改为主线严格等价的 `round(wire_scale / scale)`（保留 1/120 精度）。
+2. `--no-support-damage-buffer` 真正生效：`wl_compositor` global / bind 钳制到 v3，
+   并把违规 `damage_buffer` 请求改写成缩放后的 `wl_surface.damage`。
+3. 聚合分发层把 10 个纯内部协议标记为 internal-only，杜绝 host 对象 id 注入 guest。
+4. X11 ↔ Wayland 剪贴板双向桥接（见上表），含延迟 `SelectionRequest` 与 INCR 收发。
+5. `--frame-color` / `--dark-frame-color` 边框绘制、
+   `--allow-xwayland-emulate-screen-pos-size` RandR 模拟、
+   `--viewport-resize` per-surface 缩放注入。
+6. Debian CI 增加 `cargo test --workspace`、全目标 `cargo check --tests`、
+   `cargo fmt --check`。
+
+逐项完成度、剩余限制与 123 个单元测试的编译情况见
 [`docs/FEATURE_MATRIX.md`](FEATURE_MATRIX.md)。需要特别说明的是：
-**本环境为 Windows 主机，只能做交叉类型检查，未在真实 Crostini 设备上运行
-Linux 二进制或执行 `cargo test`。**
+**本环境为 Windows 主机，只能做交叉类型检查；Linux 测试二进制由 Debian CI
+执行，仍未在真实 Crostini 设备上跑过 `-X` 启动流程。**

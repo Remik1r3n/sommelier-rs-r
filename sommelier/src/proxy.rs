@@ -56,6 +56,7 @@ struct SommelierHandler {
     keyboard: crate::handler::keyboard::KeyboardHandler,
     seat: crate::handler::seat::SeatHandler,
     output: crate::handler::output::OutputHandler,
+    viewport: crate::handler::viewport::ViewportHandler,
 }
 
 impl SommelierHandler {
@@ -77,6 +78,7 @@ impl SommelierHandler {
             keyboard: crate::handler::keyboard::KeyboardHandler::new(),
             seat: crate::handler::seat::SeatHandler,
             output: crate::handler::output::OutputHandler::new(),
+            viewport: crate::handler::viewport::ViewportHandler,
         }
     }
 }
@@ -118,6 +120,8 @@ impl Client {
             is_xwayland_client,
         );
         ctx.vm_identifier = cfg.vm_identifier.clone();
+        ctx.damage_buffer = cfg.damage_buffer;
+        ctx.viewport_resize = cfg.viewport_resize;
         // `--force-drm-device` also selects the GBM node used by the local
         // SHM/memfd fallback allocator.
         if let Some(path) = &cfg.force_drm_device {
@@ -146,6 +150,10 @@ impl Client {
         // Take the receiver out of `self` so the select! futures borrow
         // disjoint locals rather than `&mut self` twice.
         let mut wm_commands = self.wm_commands.take();
+        // X11 clipboard changes do not generate Wayland traffic of their own;
+        // poll them on a timer even when the guest connection is idle.
+        let mut clipboard_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+        clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -183,7 +191,58 @@ impl Client {
                         }
                     }
                 }
+                _ = clipboard_tick.tick() => {}
             }
+            self.poll_selection().await;
+        }
+    }
+
+    /// Drive the X11 <-> Wayland clipboard state machine and flush any
+    /// synthetic Wayland messages it produced. `handle_msgs` already drains
+    /// the two queues for traffic-driven handlers; this path covers changes
+    /// that originate in the X11 WM (owner changes, ConvertSelection results).
+    async fn poll_selection(&mut self) {
+        if self.x11.is_none() {
+            return;
+        }
+        {
+            let selection = self.ctx.selection.clone();
+            let mut guard = selection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.poll(&mut self.ctx);
+        }
+
+        let mut client_data = Vec::new();
+        let mut client_fds = Vec::new();
+        for (msg, fds) in self.ctx.host_to_client_queue.drain(..) {
+            client_data.extend_from_slice(&msg);
+            client_fds.extend(fds);
+        }
+        if !client_data.is_empty()
+            && self
+                .client_conn
+                .send(&client_data, &client_fds)
+                .await
+                .is_err()
+        {
+            log::debug!("x11: failed to deliver clipboard events to guest");
+        }
+        for fd in client_fds {
+            let _ = nix::unistd::close(fd);
+        }
+
+        let mut host_data = Vec::new();
+        let mut host_fds = Vec::new();
+        for (msg, fds) in self.ctx.client_to_host_queue.drain(..) {
+            host_data.extend_from_slice(&msg);
+            host_fds.extend(fds);
+        }
+        if !host_data.is_empty() && self.host_conn.send(&host_data, &host_fds).await.is_err() {
+            log::debug!("x11: failed to deliver clipboard requests to host");
+        }
+        for fd in host_fds {
+            let _ = nix::unistd::close(fd);
         }
     }
 
@@ -791,7 +850,9 @@ protocols::text_input_unstable_v3::impl_sommelier_delegates!(SommelierHandler, {
 });
 impl protocols::text_input_unstable_v3::ProtocolHandler for SommelierHandler {}
 
-protocols::viewporter::impl_sommelier_delegates!(SommelierHandler, {});
+protocols::viewporter::impl_sommelier_delegates!(SommelierHandler, {
+    wp_viewport: viewport
+});
 impl protocols::viewporter::ProtocolHandler for SommelierHandler {}
 
 protocols::xdg_decoration_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {});

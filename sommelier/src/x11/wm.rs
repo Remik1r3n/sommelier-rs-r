@@ -203,6 +203,24 @@ fn state_action(action: u32, current: bool) -> bool {
 // x11rb request/reply helpers. Errors are logged, never panicked on.
 // ---------------------------------------------------------------------------
 
+/// Parse `--frame-color` (`#RRGGBB`, `0xRRGGBB` or bare `RRGGBB`) into an
+/// X11 0x00RRGGBB pixel value. Invalid values disable the border.
+fn parse_frame_color(value: &str) -> Option<u32> {
+    let s = value.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let hex = s
+        .strip_prefix('#')
+        .or_else(|| s.strip_prefix("0x"))
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
 fn checked<C: RequestConnection>(result: Result<VoidCookie<'_, C>, ConnectionError>, what: &str) {
     match result {
         Ok(cookie) => {
@@ -262,8 +280,8 @@ fn send_synthetic_configure<C: RequestConnection>(
     );
 }
 
-fn write_frame_extents<C: RequestConnection>(conn: &C, atoms: &AtomTable, xid: u32) {
-    let zeros = [0u32; 4];
+fn write_frame_extents<C: RequestConnection>(conn: &C, atoms: &AtomTable, xid: u32, border: u32) {
+    let extents = [border; 4];
     checked(
         xproto::change_property(
             conn,
@@ -272,8 +290,8 @@ fn write_frame_extents<C: RequestConnection>(conn: &C, atoms: &AtomTable, xid: u
             atoms.get(X11Atom::NetFrameExtents),
             atoms.get(X11Atom::Cardinal),
             32,
-            zeros.len() as u32,
-            &u32s_to_bytes(&zeros),
+            extents.len() as u32,
+            &u32s_to_bytes(&extents),
         ),
         "write _NET_FRAME_EXTENTS",
     );
@@ -610,6 +628,12 @@ struct WmState {
     app_id_prefix: String,
     shape_enabled: bool,
     quit: bool,
+    /// `--allow-xwayland-emulate-screen-pos-size` (RandR emulation).
+    allow_randr_emu: bool,
+    last_output_rects_gen: u64,
+    /// Parsed `--frame-color` / `--dark-frame-color`, as X11 0xRRGGBB pixels.
+    frame_color: Option<u32>,
+    dark_frame_color: Option<u32>,
 }
 
 impl WmState {
@@ -628,6 +652,60 @@ impl WmState {
             app_id_prefix: opts.app_id_prefix.clone(),
             shape_enabled: opts.enable_xshape,
             quit: false,
+            allow_randr_emu: opts.allow_randr_emu,
+            last_output_rects_gen: 0,
+            frame_color: parse_frame_color(&opts.frame_color),
+            dark_frame_color: parse_frame_color(&opts.dark_frame_color),
+        }
+    }
+
+    /// Write `_XWAYLAND_RANDR_EMU_MONITOR_RECTS` whenever the proxy reports a
+    /// new host output layout. Xwayland reads this property to emulate
+    /// multiple monitors for X11 clients (mainline
+    /// `--allow-xwayland-emulate-screen-pos-size`).
+    fn update_randr_emu<C>(&mut self, conn: &C, bridge: &X11Bridge)
+    where
+        C: RequestConnection,
+    {
+        if !self.allow_randr_emu {
+            return;
+        }
+        let (generation, rects) = bridge.output_rects_snapshot();
+        if generation == self.last_output_rects_gen || rects.is_empty() {
+            return;
+        }
+        self.last_output_rects_gen = generation;
+        let mut bytes = Vec::with_capacity(rects.len() * 4);
+        for value in &rects {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let atoms = self.atoms.clone();
+        checked(
+            xproto::change_property(
+                conn,
+                PropMode::REPLACE,
+                self.root,
+                atoms.get(X11Atom::XwaylandRandrEmuMonitorRects),
+                atoms.get(X11Atom::Cardinal),
+                32,
+                rects.len() as u32,
+                &bytes,
+            ),
+            "update _XWAYLAND_RANDR_EMU_MONITOR_RECTS",
+        );
+        debug!(
+            "x11: RandR emulation: {} host output rectangles published",
+            rects.len() / 4
+        );
+    }
+
+    /// Frame colour for a window; dark-theme windows get the dark colour
+    /// when one was configured.
+    fn border_color(&self, info: &X11WindowInfo) -> Option<u32> {
+        if info.dark_theme {
+            self.dark_frame_color.or(self.frame_color)
+        } else {
+            self.frame_color.or(self.dark_frame_color)
         }
     }
 
@@ -923,7 +1001,7 @@ impl WmState {
             Event::FocusOut(e) => self.on_focus(bridge, e.event, false),
             Event::SelectionRequest(e) => {
                 self.clipboard
-                    .handle_selection_request(conn, &atoms_snapshot, &e)
+                    .handle_selection_request(conn, &atoms_snapshot, &e, bridge)
             }
             Event::SelectionNotify(e) => {
                 self.clipboard
@@ -1018,11 +1096,28 @@ impl WmState {
         checked(xproto::map_window(conn, xid), "map_window");
         let mut attr = ChangeWindowAttributesAux::new();
         attr.win_gravity = Some(Gravity::NORTH_WEST);
+        // `--frame-color` / `--dark-frame-color`: paint a 1px X11 border on
+        // the client window. A full reparenting frame would change every
+        // geometry calculation, so mainline's visible result (a coloured
+        // outline + _NET_FRAME_EXTENTS) is achieved without reparenting.
+        let border = self.border_color(&xinfo);
+        if let Some(color) = border {
+            attr.border_pixel = Some(color);
+        }
         checked(
             xproto::change_window_attributes(conn, xid, &attr),
             "set win_gravity NORTH_WEST",
         );
-        write_frame_extents(conn, &self.atoms, xid);
+        let border_width = if border.is_some() { 1 } else { 0 };
+        if border_width != 0 {
+            let mut cw = ConfigureWindowAux::new();
+            cw.border_width = Some(border_width);
+            checked(
+                xproto::configure_window(conn, xid, &cw),
+                "set frame border width",
+            );
+        }
+        write_frame_extents(conn, &self.atoms, xid, border_width);
         write_wm_state(conn, &self.atoms, xid, WM_STATE_NORMAL);
 
         let win = self.windows.entry(xid).or_insert_with(|| XWindow::new(xid));
@@ -1319,7 +1414,7 @@ impl WmState {
 
     // ----- WmEvent (proxy -> WM) handlers -----
 
-    fn handle_wm_event<C>(&mut self, conn: &C, bridge: &X11Bridge, ev: WmEvent)
+    fn handle_wm_event<C>(&mut self, conn: &C, _bridge: &X11Bridge, ev: WmEvent)
     where
         C: RequestConnection + X11Connection,
     {
@@ -1359,18 +1454,33 @@ impl WmState {
             }
             WmEvent::Close { xid } => self.on_close(conn, xid),
             WmEvent::ClipboardTargets { targets } => {
+                // Wayland -> X11: these are the MIME types an X11 requestor
+                // sees in TARGETS. Do NOT publish them back through
+                // set_clipboard_targets(): that channel is X11 -> Wayland and
+                // would synthesize a bogus offer on every guest connection.
                 self.clipboard.note_targets(targets);
-                bridge.set_clipboard_targets(self.clipboard.targets().to_vec());
             }
             WmEvent::ClipboardData { target, data } => {
-                self.clipboard.note_data(target.clone(), data.clone());
-                bridge.set_clipboard_data(target, data);
+                // Likewise `set_clipboard_data` is reserved for ConvertSelection
+                // results (X11 -> Wayland). Feeding prefetched Wayland bytes
+                // back into it would make the X11 selection look like an owner
+                // change to the proxy.
+                self.clipboard.note_data(target, data);
+            }
+            WmEvent::RequestClipboardData { target } => {
+                // Wayland asked for the bytes of an X11 CLIPBOARD target:
+                // run ConvertSelection against the current X11 owner.
+                self.clipboard
+                    .request_target(conn, &atoms_snapshot, &target);
             }
             WmEvent::Shutdown => {
                 info!("x11: WM thread shutting down");
                 self.quit = true;
             }
         }
+        // A ClipboardData event may unblock SelectionRequests that were held
+        // while the proxy fetched their payload.
+        self.clipboard.flush_pending(conn, &atoms_snapshot);
     }
 
     /// Close: `WM_DELETE_WINDOW` if supported, otherwise `kill_client`.
@@ -1465,6 +1575,10 @@ pub fn run<C>(
         }
 
         state.retry_pending_surfaces(&bridge);
+        state.update_randr_emu(&conn, &bridge);
+        // Expire deferred SelectionRequests even when no new WmEvent arrives.
+        let atoms_snapshot = state.atoms.clone();
+        state.clipboard.flush_pending(&conn, &atoms_snapshot);
         if let Err(e) = conn.flush() {
             warn!("x11: flush failed, leaving WM loop: {}", e);
             break;
@@ -1477,6 +1591,44 @@ pub fn run<C>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_color_parsing_accepts_hex_forms() {
+        assert_eq!(parse_frame_color("#1a2b3c"), Some(0x001a_2b3c));
+        assert_eq!(parse_frame_color("0xFF8800"), Some(0x00ff_8800));
+        assert_eq!(parse_frame_color("AABBCC"), Some(0x00aa_bbcc));
+        assert_eq!(parse_frame_color("  #000000 "), Some(0));
+        assert_eq!(parse_frame_color(""), None);
+        assert_eq!(parse_frame_color("#12345"), None);
+        assert_eq!(parse_frame_color("not-a-color"), None);
+    }
+
+    #[test]
+    fn dark_theme_prefers_dark_frame_color() {
+        let opts = X11Options {
+            xwayland_path: "Xwayland".into(),
+            xwayland_cmd_prefix: vec![],
+            x_display: None,
+            x_auth: None,
+            x_font_path: None,
+            gl_driver_path: None,
+            enable_xshape: false,
+            clipboard_manager: true,
+            shm: false,
+            scale: 1.0,
+            app_id_prefix: String::new(),
+            frame_color: "#ffffff".into(),
+            dark_frame_color: "#202020".into(),
+            allow_randr_emu: true,
+        };
+        let state = WmState::new(1, 1920, 1080, AtomTable::new(), &opts);
+        assert!(state.allow_randr_emu);
+        let light = X11WindowInfo::default();
+        let mut dark = X11WindowInfo::default();
+        dark.dark_theme = true;
+        assert_eq!(state.border_color(&light), Some(0x00ff_ffff));
+        assert_eq!(state.border_color(&dark), Some(0x0020_2020));
+    }
 
     fn hints_bytes() -> Vec<u8> {
         // 18 INT32 fields, little endian.

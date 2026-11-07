@@ -28,6 +28,7 @@ limitations under the License.
 //! through `X11Bridge::set_clipboard_targets()` / `set_clipboard_data()`.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use x11rb::connection::RequestConnection;
@@ -47,6 +48,23 @@ const INCR_THRESHOLD: usize = 128 * 1024;
 const INCR_CHUNK: usize = 32 * 1024;
 /// How many 4-byte units to fetch per property read.
 const PROPERTY_LONG_LENGTH: u32 = 4096;
+/// How long a SelectionRequest may wait for the Wayland side to fetch data
+/// before we reply with property NONE (ICCCM failure).
+const SELECTION_REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// A `SelectionRequest` held while the proxy fetches the corresponding
+/// Wayland payload. Storing scalars instead of the event keeps this `Copy`
+/// and avoids depending on x11rb's event derive set.
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    requestor: u32,
+    time: u32,
+    selection: u32,
+    target: u32,
+    property: u32,
+    name: String,
+    deadline: Instant,
+}
 
 /// One in-progress INCR *send* (we are the selection owner).
 struct IncrTransfer {
@@ -62,6 +80,10 @@ struct IncrTransfer {
 struct RecvIncr {
     requestor: u32,
     property: u32,
+    /// Target atom of the conversion. TARGETS is a u32 list; every other
+    /// target is raw bytes and must be published as clipboard data.
+    target: u32,
+    is_targets: bool,
     data: Vec<u8>,
 }
 
@@ -83,6 +105,8 @@ pub struct ClipboardBridge {
     incr: HashMap<u32, IncrTransfer>,
     /// Active INCR receive (at most one at a time).
     recv_incr: Option<RecvIncr>,
+    /// SelectionRequests deferred until the Wayland proxy supplies the data.
+    pending: Vec<PendingRequest>,
 }
 
 impl ClipboardBridge {
@@ -99,10 +123,19 @@ impl ClipboardBridge {
             timestamp: 1,
             incr: HashMap::new(),
             recv_incr: None,
+            pending: Vec::new(),
         }
     }
 
-    /// TARGETS currently known from the Wayland side.
+    /// True when at least one SelectionRequest is waiting for Wayland data.
+    /// Exposed for diagnostics and unit tests; the WM uses `flush_pending`.
+    #[allow(dead_code)]
+    pub fn has_pending_requests(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// TARGETS currently known from the Wayland side (diagnostics/tests).
+    #[allow(dead_code)]
     pub fn targets(&self) -> &[String] {
         &self.targets
     }
@@ -135,6 +168,7 @@ impl ClipboardBridge {
         conn: &C,
         atoms: &AtomTable,
         ev: &SelectionRequestEvent,
+        bridge: &X11Bridge,
     ) {
         let a = |x: X11Atom| atoms.get(x);
         let target = ev.target;
@@ -148,7 +182,10 @@ impl ClipboardBridge {
         let mut ok = false;
 
         if target == a(X11Atom::Targets) {
-            let list = [
+            // Classical ICCCM atoms plus whatever the Wayland side advertised
+            // (WmEvent::ClipboardTargets -> note_targets). Interning the names
+            // here keeps TARGETS honest for non-text MIME types too.
+            let mut list = vec![
                 a(X11Atom::Targets),
                 a(X11Atom::Timestamp),
                 a(X11Atom::Utf8String),
@@ -156,6 +193,18 @@ impl ClipboardBridge {
                 a(X11Atom::Text),
                 a(X11Atom::WlSelection),
             ];
+            for name in &self.targets {
+                if name.is_empty() {
+                    continue;
+                }
+                if let Ok(cookie) = xproto::intern_atom(conn, false, name.as_bytes()) {
+                    if let Ok(reply) = cookie.reply() {
+                        if reply.atom != 0 && !list.contains(&reply.atom) {
+                            list.push(reply.atom);
+                        }
+                    }
+                }
+            }
             let bytes = u32_list_bytes(&list);
             ok = change_prop(
                 conn,
@@ -178,53 +227,30 @@ impl ClipboardBridge {
                 1,
                 &bytes,
             );
-        } else if let Some((type_atom, data)) = self.resolve_data(conn, target, atoms) {
-            if data.len() > INCR_THRESHOLD {
-                // INCR: advertise the total length, then stream chunks as the
-                // requestor deletes the property (see handle_property_notify).
-                let len_bytes = (data.len() as u32).to_le_bytes();
-                ok = change_prop(
-                    conn,
-                    ev.requestor,
-                    property,
-                    a(X11Atom::Incr),
-                    32,
-                    1,
-                    &len_bytes,
-                );
-                if ok {
-                    // We must observe PropertyNotify(DELETE) on the requestor.
-                    // Degraded path: this narrows any pre-existing event mask on
-                    // a foreign requestor; a full implementation should OR with
-                    // the mask installed in CreateNotify instead.
-                    let mut aux = ChangeWindowAttributesAux::new();
-                    aux.event_mask = Some(EventMask::PROPERTY_CHANGE);
-                    if let Err(e) = xproto::change_window_attributes(conn, ev.requestor, &aux) {
-                        warn!("x11: selecting PROPERTY_CHANGE for INCR failed: {}", e);
-                    }
-                    self.incr.insert(
-                        ev.requestor,
-                        IncrTransfer {
-                            requestor: ev.requestor,
-                            property,
-                            target: type_atom,
-                            data,
-                            offset: 0,
-                        },
-                    );
-                }
-            } else {
-                ok = change_prop(
-                    conn,
-                    ev.requestor,
-                    property,
-                    type_atom,
-                    8,
-                    data.len() as u32,
-                    &data,
-                );
-            }
+        } else if self.serve_data(conn, atoms, ev.requestor, property, target) {
+            ok = true;
         } else {
+            // Data is not in our cache yet. Ask the Wayland proxy to fetch it
+            // from the active offer/source and hold the SelectionRequest until
+            // `flush_pending` sees the bytes (or the deadline expires).
+            let name = atom_name(conn, target);
+            if !name.is_empty() {
+                debug!(
+                    "x11: deferring SelectionRequest for {} until Wayland supplies data",
+                    name
+                );
+                self.pending.push(PendingRequest {
+                    requestor: ev.requestor,
+                    time: ev.time,
+                    selection: ev.selection,
+                    target,
+                    property,
+                    name: name.clone(),
+                    deadline: Instant::now() + SELECTION_REQUEST_TIMEOUT,
+                });
+                bridge.request_clipboard_data(name);
+                return;
+            }
             warn!(
                 "x11: no clipboard data for target atom {} (requestor {:#x})",
                 target, ev.requestor
@@ -336,6 +362,8 @@ impl ClipboardBridge {
             self.recv_incr = Some(RecvIncr {
                 requestor: ev.requestor,
                 property: ev.property,
+                target: ev.target,
+                is_targets: ev.target == a(X11Atom::Targets),
                 data: Vec::new(),
             });
             // Deleting the property prompts the owner to write the first chunk.
@@ -383,7 +411,7 @@ impl ClipboardBridge {
         // ---- INCR receive ----
         // Collect results into locals so the `&mut recv_incr` borrow ends
         // before we clear/complete the state below.
-        let mut finished_names: Option<Vec<String>> = None;
+        let mut finished: Option<(u32, bool, Vec<u8>)> = None;
         let mut consumed = false;
         if let Some(ri) = self.recv_incr.as_mut() {
             if ev.window == ri.requestor {
@@ -413,8 +441,7 @@ impl ClipboardBridge {
                     if let Some(r) = reply {
                         if r.value.is_empty() {
                             // Zero-length chunk terminates the transfer.
-                            finished_names =
-                                Some(resolve_atom_names(conn, &parse_u32_bytes(&ri.data)));
+                            finished = Some((ri.target, ri.is_targets, ri.data.clone()));
                         } else {
                             ri.data.extend_from_slice(&r.value);
                             // The read used delete=true, which already prompts
@@ -429,11 +456,22 @@ impl ClipboardBridge {
             }
         }
 
-        if let Some(names) = finished_names {
-            debug!("x11: INCR receive finished: {:?}", names);
+        if let Some((target, is_targets, data)) = finished {
             self.recv_incr = None;
-            self.targets = names.clone();
-            bridge.set_clipboard_targets(names);
+            if is_targets {
+                let names = resolve_atom_names(conn, &parse_u32_bytes(&data));
+                debug!("x11: INCR TARGETS receive finished: {:?}", names);
+                self.targets = names.clone();
+                bridge.set_clipboard_targets(names);
+            } else {
+                let name = atom_name(conn, target);
+                debug!(
+                    "x11: INCR data receive finished for {} ({} bytes)",
+                    name,
+                    data.len()
+                );
+                bridge.set_clipboard_data(name, data);
+            }
             return;
         }
         if consumed {
@@ -469,6 +507,149 @@ impl ClipboardBridge {
             debug!("x11: INCR send finished for {:#x}", t.requestor);
         } else {
             self.incr.insert(ev.window, t);
+        }
+    }
+
+    /// Write the cached payload for `target` onto `requestor`'s property,
+    /// starting an INCR transfer for large payloads. Returns false when the
+    /// data is not available (yet).
+    fn serve_data<C: RequestConnection>(
+        &mut self,
+        conn: &C,
+        atoms: &AtomTable,
+        requestor: u32,
+        property: u32,
+        target: u32,
+    ) -> bool {
+        let Some((type_atom, data)) = self.resolve_data(conn, target, atoms) else {
+            return false;
+        };
+        let a = |x: X11Atom| atoms.get(x);
+        if data.len() <= INCR_THRESHOLD {
+            return change_prop(
+                conn,
+                requestor,
+                property,
+                type_atom,
+                8,
+                data.len() as u32,
+                &data,
+            );
+        }
+
+        // INCR: advertise the total length, then stream chunks as the
+        // requestor deletes the property (see handle_property_notify).
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        if !change_prop(
+            conn,
+            requestor,
+            property,
+            a(X11Atom::Incr),
+            32,
+            1,
+            &len_bytes,
+        ) {
+            return false;
+        }
+        let mut aux = ChangeWindowAttributesAux::new();
+        aux.event_mask = Some(EventMask::PROPERTY_CHANGE);
+        if let Err(e) = xproto::change_window_attributes(conn, requestor, &aux) {
+            warn!("x11: selecting PROPERTY_CHANGE for INCR failed: {}", e);
+        }
+        self.incr.insert(
+            requestor,
+            IncrTransfer {
+                requestor,
+                property,
+                target: type_atom,
+                data,
+                offset: 0,
+            },
+        );
+        true
+    }
+
+    /// Complete or expire deferred SelectionRequests. Called from the WM loop
+    /// on every iteration, so a late Wayland payload can still satisfy a
+    /// request that arrived while the fetch was in flight.
+    pub fn flush_pending<C: RequestConnection>(&mut self, conn: &C, atoms: &AtomTable) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut index = 0;
+        while index < self.pending.len() {
+            // Check availability without mutating `self` yet.
+            let available = self
+                .resolve_data(conn, self.pending[index].target, atoms)
+                .is_some();
+            let expired = now >= self.pending[index].deadline;
+            if !available && !expired {
+                index += 1;
+                continue;
+            }
+            let req = self.pending.remove(index);
+            if available {
+                let served = self.serve_data(conn, atoms, req.requestor, req.property, req.target);
+                send_selection_notify_raw(
+                    conn,
+                    req.requestor,
+                    req.time,
+                    req.selection,
+                    req.target,
+                    if served { req.property } else { 0 },
+                );
+                debug!("x11: deferred SelectionRequest for {} served", req.name);
+            } else {
+                warn!("x11: deferred SelectionRequest for {} timed out", req.name);
+                send_selection_notify_raw(
+                    conn,
+                    req.requestor,
+                    req.time,
+                    req.selection,
+                    req.target,
+                    0,
+                );
+            }
+        }
+    }
+
+    /// Ask the current X11 CLIPBOARD owner to convert `target` into the
+    /// `_WL_SELECTION` property on our selection window. The reply is picked
+    /// up by `handle_selection_notify` and published on the bridge.
+    pub fn request_target<C: RequestConnection>(&self, conn: &C, atoms: &AtomTable, target: &str) {
+        if self.selection_window == 0 || target.is_empty() {
+            return;
+        }
+        let atom = match xproto::intern_atom(conn, false, target.as_bytes()) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => reply.atom,
+                Err(e) => {
+                    warn!("x11: intern_atom({}) failed: {}", target, e);
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!("x11: intern_atom({}) request failed: {}", target, e);
+                return;
+            }
+        };
+        if atom == 0 {
+            return;
+        }
+        let a = |x: X11Atom| atoms.get(x);
+        if let Err(e) = xproto::convert_selection(
+            conn,
+            self.selection_window,
+            a(X11Atom::Clipboard),
+            atom,
+            a(X11Atom::WlSelection),
+            0u32,
+        ) {
+            warn!(
+                "x11: convert_selection(CLIPBOARD, {}) failed: {}",
+                target, e
+            );
         }
     }
 
@@ -576,16 +757,34 @@ fn send_selection_notify<C: RequestConnection>(
     ev: &SelectionRequestEvent,
     property: u32,
 ) {
+    send_selection_notify_raw(
+        conn,
+        ev.requestor,
+        ev.time,
+        ev.selection,
+        ev.target,
+        property,
+    );
+}
+
+fn send_selection_notify_raw<C: RequestConnection>(
+    conn: &C,
+    requestor: u32,
+    time: u32,
+    selection: u32,
+    target: u32,
+    property: u32,
+) {
     let notify = SelectionNotifyEvent {
         response_type: xproto::SELECTION_NOTIFY_EVENT,
         sequence: 0,
-        time: ev.time,
-        requestor: ev.requestor,
-        selection: ev.selection,
-        target: ev.target,
+        time,
+        requestor,
+        selection,
+        target,
         property,
     };
-    if let Err(e) = xproto::send_event(conn, false, ev.requestor, EventMask::NO_EVENT, notify) {
+    if let Err(e) = xproto::send_event(conn, false, requestor, EventMask::NO_EVENT, notify) {
         warn!("x11: send_event(SelectionNotify) failed: {}", e);
     }
 }
@@ -609,6 +808,22 @@ mod tests {
         cb.note_data("text/plain;charset=utf-8".to_string(), b"hello".to_vec());
         assert_eq!(cb.text_data.as_deref(), Some(&b"hello"[..]));
         assert_eq!(cb.targets().len(), 0);
+    }
+
+    #[test]
+    fn deferred_request_tracking_is_observable() {
+        let mut cb = ClipboardBridge::new(1);
+        assert!(!cb.has_pending_requests());
+        cb.pending.push(PendingRequest {
+            requestor: 2,
+            time: 0,
+            selection: 3,
+            target: 4,
+            property: 5,
+            name: "UTF8_STRING".into(),
+            deadline: Instant::now() + Duration::from_secs(30),
+        });
+        assert!(cb.has_pending_requests());
     }
 
     #[test]

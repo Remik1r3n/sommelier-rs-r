@@ -40,10 +40,11 @@
 | X11 窗口状态 → `set_title` / `set_min_size` / `set_max_size` / `fullscreen` / `maximized` / `minimized` / `draw_attention` | ✅ | `proxy.rs::update_toplevel` |
 | host `xdg_toplevel.configure` / `close` → X11 ConfigureNotify / WM_DELETE_WINDOW | ✅ | `proxy.rs::forward_x11_toplevel_event` |
 | X11 焦点、激活、move/resize、ShapeNotify | ✅ | `wm.rs` 事件分发 |
-| X11 selection：TARGETS / TIMESTAMP / UTF8_STRING / STRING / INCR / XFixes | ⚠️ | `x11/clipboard.rs` 骨架完整，但与 Wayland data-device 的对象桥接未接（见 §6） |
-| X11 窗口边框绘制（frame / dark frame color） | ❌ | 仅解析 `--frame-color` / `--dark-frame-color` |
-| `_XWAYLAND_RANDR_EMU_MONITOR_RECTS` | ⚠️ | 仅解析 `--allow-xwayland-emulate-screen-pos-size` |
-| X11 ↔ Wayland 剪贴板互通 | ⚠️ | 两侧各自可用，桥接未接（见 §6） |
+| X11 selection：TARGETS / TIMESTAMP / UTF8_STRING / STRING / INCR / XFixes | ✅ | `x11/clipboard.rs`；无缓存数据时延迟回复 `SelectionRequest`（1.5 s 超时） |
+| X11 窗口边框绘制（frame / dark frame color） | ✅ | `wm.rs::border_color` / `parse_frame_color`，1px X11 border + `_NET_FRAME_EXTENTS`；不做 reparenting frame |
+| `_XWAYLAND_RANDR_EMU_MONITOR_RECTS` | ✅ | `handler/output.rs` 发布虚拟坐标布局 → `bridge.rs` → `wm.rs::update_randr_emu` 写 root 属性（内容不变时不重写） |
+| X11 ↔ guest Wayland 剪贴板互通 | ✅ | `x11/selection.rs`：X11 owner → 合成 `wl_data_device.data_offer`/`offer`/`selection`，`receive` → `ConvertSelection` → 回写 fd；反向追踪 host offer / guest data source，预取小体积文本载荷给 X11 `SelectionRequest` |
+| X11 → ChromeOS host 剪贴板导出 | ❌ | 需要在 host 连接上合成 `wl_data_source` 并应答 `send` 事件，见 §6.1 |
 
 ## 3. 缩放 / 坐标 / 输出
 
@@ -57,9 +58,9 @@
 | `zxdg_output_v1.logical_position/logical_size` 改写 | ✅ | `handler/output.rs` |
 | `wp_fractional_scale_v1.preferred_scale` 改写 | ✅ | `handler/output.rs` |
 | 多输出布局、按位置推断输出、虚拟桌面尺寸 | ✅ | `transform.rs::set_outputs` / `virtual_dimensions` |
-| per-surface `wp_viewport` 缩放（非可缩放窗口） | ⚠️ | 参数已解析、`viewporter` 协议转发，但未做 per-surface 缩放注入 |
-| `wl_surface.damage_buffer` 支持开关 | ⚠️ | `--no-support-damage-buffer` 已解析，未对 `wl_compositor` 做 version clamp |
-| `preferred_scale` 严格等价于主线 `round(wire_scale / scale)` | ⚠️ | 当前量化到 120 的整数倍；`transform.rs` 注释里给出一行替换方案 |
+| per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通 |
+| `wl_surface.damage_buffer` 支持开关 | ✅ | `--no-support-damage-buffer` 把 `wl_compositor` 的 global 与 bind 都 clamp 到 v3；违规 v4 `damage_buffer` 请求被 `handler/compositor.rs` 改写为按坐标系变换的 v1 `damage` |
+| `preferred_scale` 严格等价于主线 `round(wire_scale / scale)` | ✅ | 保留 1/120 精度，不再量化到 120 的整数倍；含分数 scale 单测 |
 
 ## 4. ChromeOS 专有能力（保留自 `virtwl`）
 
@@ -90,6 +91,8 @@
 | 协议 codegen 从 XML 自动枚举 | ✅ | `build.rs` 扫描目录，33 个 XML → 33 个模块 + 聚合分发 |
 | 聚合 `dispatch_request` / `dispatch_event` / `impl_generated_delegates!` | ✅ | `wayland_codegen/src/aggregate.rs` |
 | `&str` handler 参数（非 `&String`） | ✅ | 从 `main` 取回并统一全部手写 handler |
+| 内部绑定协议的 host event 隔离 | ✅ | `aggregate.rs::INTERNAL_ONLY` 覆盖 10 个纯内部模块；text-input v1 / extension 因需要转 v3 事件而有意保留转发 |
+| `wl_compositor` 版本钳制 + `damage_buffer` → `damage` 改写 | ✅ | `handler/registry.rs` + `handler/compositor.rs`，含 2 个单测 |
 | quirks textproto-like 规则（steam_game_id / always / enable / disable / merge） | ✅ | `quirks.rs`；不引入 protobuf，多 condition 整条跳过 |
 | 主线 CLI + `SOMMELIER_*` 环境变量 | ✅ | `config.rs`，7 个配置单测 |
 
@@ -109,32 +112,39 @@
 `wayland`, `xdg-activation-v1`, `xdg-decoration-unstable-v1`,
 `xdg-dialog-v1`, `xdg-output-unstable-v1`, `xdg-shell`。
 
-其中 11 个协议有手写 delegation（见 `proxy.rs`），其余由聚合宏生成纯转发实现；
-`aura_shell` 标记为 internal-only，其 host event 不会注入 guest。
+其中 12 个协议有手写 delegation（见 `proxy.rs`），其余由聚合宏生成纯转发实现；
+`aggregate.rs::INTERNAL_ONLY` 列出 10 个纯内部绑定模块，其 host event 在聚合
+分发层直接丢弃，避免把 host 对象 id 注入 guest。
 
 ## 6. 已知限制（按影响排序）
 
-1. **X11 ↔ Wayland 剪贴板桥接未完成。**
-   - WM 侧 `ClipboardBridge` 已能处理 X11 `SelectionRequest` / XFixes / INCR，
-     并把结果通过 `X11Bridge::set_clipboard_targets/data` 发布。
-   - proxy 侧尚未 `take_clipboard_targets/data()` 合成 guest `wl_data_offer`
-     并响应 `wl_data_offer.receive`；反向的 `WmEvent::ClipboardTargets/Data`
-     也未由 guest `wl_data_source` 事件触发。
-   - 因此 Wayland 应用 ↔ host 剪贴板正常（原有 `data_device` 路径），
-     X11 应用 ↔ host 剪贴板仍不完整。
-2. **未在真实 Crostini 设备上做端到端验证。** 本环境为 Windows 主机 +
-   `x86_64-unknown-linux-gnu` 交叉检查，可以编译和类型检查，但不能运行
-   Linux 测试二进制。`cargo test` 需在 Linux guest 或 CI 上执行。
-3. **X11 边框绘制、RandR 模拟、per-surface viewport 缩放、damage_buffer
-   version clamp、explicit fence** 均为参数解析/协议转发级别，尚未完整实现。
+1. **X11 → ChromeOS host 剪贴板导出未实现。**
+   - 已打通的是 X11 ↔ guest Wayland：`x11/selection.rs` 合成 guest
+     `wl_data_offer`、按需 `ConvertSelection` 并回写 `receive` 的 fd；反向把
+     host offer / guest data source 的 MIME 与文本载荷预取给 X11。
+   - 若要让 ChromeOS host 侧直接粘贴 X11 内容，还需要在 host 连接上 bind
+     `wl_data_device_manager` / `wl_seat`，合成 host `wl_data_source`、
+     `set_selection`，并应答 host 发来的 `wl_data_source.send(mime, fd)`。
+     该路径会与 host compositor 的 selection 状态直接交互，协议错误会断开
+     整条 host 连接；在缺少真实设备验证的条件下本次不引入。
+2. **未在真实 Crostini 设备上做端到端验证。** 开发机为 Windows 主机，只能做
+   `x86_64-unknown-linux-gnu` 交叉类型检查。`cargo test` 已加入 Debian CI
+   （x86_64 runner 真机执行），但 `-X` 启动流程与 ChromeOS host 协议行为
+   仍需在 Crostini guest 内确认。
+3. **explicit fence**：`--explicit-fence` 与
+   `zwp_linux_explicit_synchronization_v1` XML 就绪，但未接入
+   `linux_explicit_synchronization` 的 fence 收发逻辑；该协议目前按内部
+   global 过滤，不向 guest 暴露。
 4. **`--parent` 语义简化**：主线是 fork 出独立 worker 进程，本项目是同一进程内
    的 tokio task；隔离性弱于主线。
-5. **内部绑定协议的 host event**：`registry.rs` 通过 `INTERNAL_GLOBALS` 阻止
-   guest 绑定这些接口，但只有 `aura_shell` 在聚合分发层标记为 internal-only。
-   实践中 host 不会对未绑定的对象发事件，风险较低。
+5. **大体积剪贴板载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，
+   上限 4 MiB；超过上限或非预取类型由延迟 `SelectionRequest` 触发按需
+   获取，1.5 s 内未取到会按 ICCCM 回复 property NONE。X11 → Wayland 方向
+   不受此限制（`ConvertSelection` 直接回写 fd）。
 6. **`current_thread` Tokio runtime 是硬约束**：`KeyboardHandler` 中的
    `xkbcommon` 对象 `!Send`，依赖 `unsafe impl Send`；任何改为多线程 runtime
-   的尝试都会破坏该不变量。
+   的尝试都会破坏该不变量。剪贴板的管道读写也因此用 `tokio::fs` 的
+   blocking pool 完成，不占 runtime 线程。
 
 ## 7. 验证结果
 
@@ -143,10 +153,11 @@
 | `cargo check --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | build script 生成 | ✅ 33 个协议模块 + 1 个聚合模块（34 个 include） |
-| 单元测试 | 108 个 `#[test]` 已编译（含 keyboard 19、transform 17、quirks 14、config 8、wm 10、output 2 等） |
+| 单元测试 | 123 个 `#[test]` 全部编译通过（含 X11 子系统 35 个、keyboard 19、transform 17、quirks 14、config 8、output 2、viewport 3、selection 5 等） |
 | CLI 参数解析 | ✅ 用独立 clap 形状验证实测：位置 display、`--display`、`-- <program>`、常见 flag 组合均正确解析，无歧义/panic |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
-| Rust 源码规模 | 15,975 行（`sommelier/src` + `wayland_codegen/src`） |
+| CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
+| Rust 源码规模 | 17,631 行（`sommelier/src` + `wayland_codegen/src`） |
 | 真实设备运行 | ❌ 未执行，见 §6.2 |
 
 ### 合并过程中修掉的既有缺陷

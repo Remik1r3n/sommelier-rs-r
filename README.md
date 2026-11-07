@@ -9,6 +9,7 @@
 ChromeOS 专有扩展等）。
 
 > 分支对比与逐文件合并决策见 [`docs/BRANCH_MERGE.md`](docs/BRANCH_MERGE.md)，
+> 当前架构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，
 > 功能完成度与已知限制见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md)。
 
 ## 与上游的关系
@@ -33,7 +34,16 @@ ChromeOS 专有扩展等）。
   `WM_S0`、`CLIPBOARD_MANAGER`、`WL_SURFACE_ID` 配对，并把 XID 映射到 host 侧
   `wl_surface` / `xdg_toplevel` / `zaura_surface`。
 - **缩放与坐标变换**：`--scale` / `--direct-scale` / `--stable-scaling` / `--dpi`，
-  `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件按虚拟坐标系重写。
+  `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件按虚拟坐标系重写；
+  `--viewport-resize` 换算 `wp_viewport.set_destination`，
+  `--no-support-damage-buffer` 会把 `wl_compositor` 降到 v3 并改写 `damage_buffer`。
+- **X11 ↔ Wayland 剪贴板桥接**：X11 `CLIPBOARD` owner 转成 guest 侧
+  `wl_data_offer`（按需 `ConvertSelection` 回写 fd）；Wayland offer / data source
+  的 MIME 与小体积文本载荷预取给 X11 `SelectionRequest`，支持 `TARGETS`、
+  `INCR` 与延迟回复。
+- **X11 桌面细节**：`--frame-color` / `--dark-frame-color` 绘制窗口边框并写
+  `_NET_FRAME_EXTENTS`；`--allow-xwayland-emulate-screen-pos-size` 依据实时输出
+  布局维护 `_XWAYLAND_RANDR_EMU_MONITOR_RECTS`。
 - **ChromeOS 集成**：`zaura_shell`（shelf app-id）、`zcr_keyboard_extension_v1`
   （系统快捷键 ack-key）、`zwp_text_input_v1` ↔ v3 互转、`SOMMELIER_ACCELERATORS`。
 - **SHM 多路径降级**：`virtwl` alloc → virtgpu host blob → GBM BO → sealed memfd。
@@ -113,22 +123,36 @@ sommelier/
     transform.rs       三坐标系变换、DPI、wl_fixed
     quirks.rs          textproto-like 规则解析
     handler/           手写协议 handler（含 output.rs 缩放改写）
-    x11/               Xwayland 启动、X11 WM、atom 表、剪贴板、bridge
+    x11/               Xwayland 启动、X11 WM、atom 表、剪贴板桥接、bridge
+      selection.rs     X11 CLIPBOARD ↔ Wayland data device 状态机
+      clipboard.rs     X11 selection / INCR / 延迟 SelectionRequest
+      bridge.rs        WM 线程与代理之间的共享状态
   build.rs             枚举 XML → 生成协议模块与聚合分发
 wayland_codegen/       XML 解析 + Rust 代码生成 + aggregate 生成
 third_party/protocols/ 33 个协议 XML
-docs/                  分支合并记录、架构基线、功能矩阵
+docs/                  当前架构、分支合并记录、上游架构基线、功能矩阵
 ```
 
 ## 已知限制
 
-详见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md)。最需要注意的两点：
+详见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md) §6。最需要注意的三点：
 
-1. **X11 ↔ Wayland 剪贴板尚未完全打通**：X11 selection 的 `TARGETS`/`INCR`
-   处理和 Wayland data-device 转发各自可用，但两者之间的对象桥接
-   （合成 `wl_data_offer` 并响应 `receive`）仍是预留接口。
-2. **尚未在真实 Crostini 设备上做端到端验证**：本机完成的是编译、测试代码
-   编译与静态检查；`cargo test` 的二进制需要在 Linux 环境执行。
+1. **X11 → ChromeOS host 剪贴板未导出**：X11 应用复制的内容可以粘贴到 guest
+   Wayland 应用，反过来 guest/host Wayland 应用复制的内容也能粘贴到 X11 应用；
+   但要让 ChromeOS host 侧直接粘贴 X11 内容，还需在 host 连接上合成一个
+   `wl_data_source` 并应答 host 的 `send` 事件，本次未实现。
+2. **尚未在真实 Crostini 设备上做端到端验证**：开发机是 Windows，只能做
+   `x86_64-unknown-linux-gnu` 交叉类型检查；`cargo test` 已加入 Debian CI
+   （`x86_64` 真机执行），但尚未在 Crostini guest 里跑过 `-X` 启动流程。
+3. **explicit fence / seccomp / `--parent` fork 模型**仍是参数或语义级简化，
+   见功能矩阵逐项说明。
+
+## 版本里程碑
+
+| Tag | 内容 |
+|---|---|
+| `v0.3.0-r-merge-baseline` | 两分支完整对比合并、X11 转发主体、统一 CLI，编译干净 |
+| `v0.3.0-r` | 剪贴板双向桥接、缩放/输出与内部协议正确性修复、RandR 模拟、边框、viewport、CI 真实测试 |
 
 ## 其他说明
 

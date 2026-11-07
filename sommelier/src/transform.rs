@@ -546,18 +546,14 @@ impl Transform {
     }
 
     /// fractional-scale：按本 API 规格把 `wire_scale/120` 除以 `ctx.scale`
-    /// 后 round，再乘 120（量化到 120 的整数倍）。
-    ///
-    /// 注意：主线 `sommelier-fractional-scale.cc:44` 实际是
-    /// `round(wire_scale / ctx->scale)`，保留 1/120 精度。若需要严格主线
-    /// 等价，把本函数体改为
-    /// `sat_u32((host_wire_scale as f64 / self.scale).round())`。
+    /// 主线 `sommelier-fractional-scale.cc:44` 为
+    /// `round(wire_scale / ctx->scale)`：wire 单位是 1/120，直接按 scale
+    /// 相除后 round，**保留 1/120 精度**，不量化到整数倍缩放。
     pub fn preferred_scale(&self, host_wire_scale: u32) -> u32 {
         if !self.scale.is_finite() || self.scale <= 0.0 {
             return host_wire_scale;
         }
-        let scaled = ((host_wire_scale as f64 / 120.0) / self.scale).round() * 120.0;
-        sat_u32(scaled)
+        sat_u32((host_wire_scale as f64 / self.scale).round())
     }
 
     /// DPI：按 `--dpi` 桶选最接近 target DPI 的一个；空桶表示使用精确
@@ -649,7 +645,7 @@ impl Transform {
 // * viewport_override / scale_round_on_x/y / per-surface own_scale 等依赖
 //   surface 状态的分支留给接线层；try_window_scale 只返回计算出的因子。
 // * guest_output_scale 采用 Wayland 分支；主线 X11 分支恒返回 1。
-// * preferred_scale 按 API 注释量化到 120 整数倍，与主线源码不同。
+// * preferred_scale 现与主线一致，直接 round(wire_scale / scale)。
 
 #[cfg(test)]
 mod tests {
@@ -888,10 +884,12 @@ mod tests {
     }
 
     #[test]
-    fn preferred_scale_quantizes_to_120() {
+    fn preferred_scale_matches_mainline_round_wire_over_scale() {
         let t = Transform::new(1.0, ScalingMode::Normal, vec![]);
         assert_eq!(t.preferred_scale(120), 120);
-        assert_eq!(t.preferred_scale(180), 240); // round(1.5) = 2
+        // Mainline keeps the 1/120 precision: 180/1.0 == 180 (1.5x),
+        // it must NOT be quantized up to 240 (2x).
+        assert_eq!(t.preferred_scale(180), 180);
         assert_eq!(t.preferred_scale(0), 0);
 
         assert_eq!(
@@ -901,6 +899,21 @@ mod tests {
         assert_eq!(
             Transform::new(0.5, ScalingMode::Normal, vec![]).preferred_scale(120),
             240
+        );
+        // Fractional scale: 150 / 1.25 = 120; a 1.6x host on a 1.25x
+        // content scale yields 153.6 -> 154, preserving sub-integer steps.
+        assert_eq!(
+            Transform::new(1.25, ScalingMode::Normal, vec![]).preferred_scale(150),
+            120
+        );
+        assert_eq!(
+            Transform::new(1.25, ScalingMode::Normal, vec![]).preferred_scale(192),
+            154
+        );
+        // Degenerate scales fall back to the host value.
+        assert_eq!(
+            Transform::new(0.0, ScalingMode::Normal, vec![]).preferred_scale(180),
+            180
         );
     }
 

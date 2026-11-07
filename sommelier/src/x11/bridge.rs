@@ -22,6 +22,7 @@ limitations under the License.
 //! provides the two message channels used to drive the host compositor.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -93,6 +94,12 @@ pub enum WmEvent {
         target: String,
         data: Vec<u8>,
     },
+    /// Ask the WM to run `ConvertSelection(CLIPBOARD, target)` against the
+    /// current X11 owner. The resulting bytes come back through
+    /// [`X11Bridge::set_clipboard_data`].
+    RequestClipboardData {
+        target: String,
+    },
     Shutdown,
 }
 
@@ -116,11 +123,28 @@ pub struct X11Bridge {
     host_globals: Mutex<(Option<u32>, Option<u32>)>,
     display: Mutex<Option<String>>,
     screen_size: Mutex<(i32, i32)>,
+    /// Host output rectangles as a flat `[x, y, w, h, ...]` list in virtual
+    /// coordinates, plus a generation counter. The WM writes these to
+    /// `_XWAYLAND_RANDR_EMU_MONITOR_RECTS` when RandR emulation is enabled.
+    output_rects: Mutex<(u64, Vec<i32>)>,
 
     // X11 -> Wayland clipboard notifications. The proxy polls these because
     // `WmCommand` deliberately has no clipboard variant (see clipboard.rs).
     clipboard_targets: Mutex<Option<Vec<String>>>,
+    /// Bumped on every owner/TARGETS change. Each guest connection keeps its
+    /// own `SelectionBridge` and must all see the same update, so the proxy
+    /// polls a (generation, snapshot) pair instead of `take()`-ing a value
+    /// that only one connection would win.
+    clipboard_targets_generation: AtomicU64,
     clipboard_data: Mutex<VecDeque<(String, Vec<u8>)>>,
+    /// Last payload per target. Request-driven transfers are asynchronous:
+    /// the request is issued on `receive`, the bytes may arrive many poll
+    /// cycles later, and several clients may ask for the same target.
+    clipboard_data_cache: Mutex<HashMap<String, Vec<u8>>>,
+    /// X11 -> proxy data requests raised by a `SelectionRequest` that the WM
+    /// cannot answer from its cache. The proxy fetches the bytes from the
+    /// active Wayland offer/source.
+    clipboard_requests: Mutex<VecDeque<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -152,8 +176,12 @@ impl X11Bridge {
             host_globals: Mutex::new((None, None)),
             display: Mutex::new(None),
             screen_size: Mutex::new((0, 0)),
+            output_rects: Mutex::new((0, Vec::new())),
             clipboard_targets: Mutex::new(None),
+            clipboard_targets_generation: AtomicU64::new(0),
             clipboard_data: Mutex::new(VecDeque::new()),
+            clipboard_data_cache: Mutex::new(HashMap::new()),
+            clipboard_requests: Mutex::new(VecDeque::new()),
         });
         (bridge, cmd_rx)
     }
@@ -243,6 +271,26 @@ impl X11Bridge {
         *lock(&self.screen_size)
     }
 
+    /// Publish the current output layout. `rects` are `(x, y, width, height)`
+    /// tuples in the guest's virtual coordinate system.
+    pub fn set_output_rects(&self, rects: &[(i32, i32, i32, i32)]) {
+        let flat: Vec<i32> = rects
+            .iter()
+            .flat_map(|&(x, y, w, h)| [x, y, w, h])
+            .collect();
+        let mut slot = lock(&self.output_rects);
+        if slot.1 == flat {
+            return; // unchanged: do not make the WM rewrite the property
+        }
+        let generation = slot.0.wrapping_add(1);
+        *slot = (generation, flat);
+    }
+
+    /// Non-destructive read for the WM thread.
+    pub fn output_rects_snapshot(&self) -> (u64, Vec<i32>) {
+        lock(&self.output_rects).clone()
+    }
+
     // ----- clipboard helpers (X11 -> Wayland direction) -----
     //
     // `WmCommand` intentionally has no clipboard variants so that the proxy's
@@ -251,23 +299,65 @@ impl X11Bridge {
     // polls them via `take_clipboard_targets()` / `take_clipboard_data()`.
 
     /// Publish the TARGETS list obtained from an X11 CLIPBOARD owner.
+    /// Every publish is a new generation so each guest connection can
+    /// synthesize its own `wl_data_offer` exactly once.
     pub fn set_clipboard_targets(&self, targets: Vec<String>) {
         *lock(&self.clipboard_targets) = Some(targets);
+        // The owner changed: payloads cached for the previous owner must not
+        // satisfy a `receive` issued after the new TARGETS arrived.
+        lock(&self.clipboard_data_cache).clear();
+        self.clipboard_targets_generation
+            .fetch_add(1, Ordering::Release);
     }
 
-    /// Consume the most recently published TARGETS list, if any.
+    /// Non-destructive TARGETS snapshot with its generation counter.
+    pub fn clipboard_targets_snapshot(&self) -> (u64, Option<Vec<String>>) {
+        let gen = self.clipboard_targets_generation.load(Ordering::Acquire);
+        (gen, lock(&self.clipboard_targets).clone())
+    }
+
+    /// Consume the most recently published TARGETS list, if any. Kept for
+    /// callers that want a one-shot read (unit tests / diagnostics).
     pub fn take_clipboard_targets(&self) -> Option<Vec<String>> {
         lock(&self.clipboard_targets).take()
     }
 
     /// Publish a converted selection payload for the Wayland side.
     pub fn set_clipboard_data(&self, target: String, data: Vec<u8>) {
-        lock(&self.clipboard_data).push_back((target, data));
+        if target.starts_with("x-sommelier/") {
+            // Internal WM notification, e.g. CLIPBOARD owner changed. Those
+            // are one-shot control messages consumed by the proxy's poll.
+            lock(&self.clipboard_data).push_back((target, data));
+        } else {
+            // ConvertSelection result: keep the latest payload per target so
+            // every guest connection can read it (a queue would let exactly
+            // one connection win the race).
+            lock(&self.clipboard_data_cache).insert(target, data);
+        }
+    }
+
+    /// Most recent payload for `target`, without consuming it.
+    pub fn clipboard_data_for(&self, target: &str) -> Option<Vec<u8>> {
+        lock(&self.clipboard_data_cache).get(target).cloned()
     }
 
     /// Consume the oldest queued selection payload.
     pub fn take_clipboard_data(&self) -> Option<(String, Vec<u8>)> {
         lock(&self.clipboard_data).pop_front()
+    }
+
+    /// WM -> proxy: an X11 `SelectionRequest` needs bytes for `target`.
+    pub fn request_clipboard_data(&self, target: String) {
+        let mut q = lock(&self.clipboard_requests);
+        // Coalesce duplicate requests while one is still in flight.
+        if !q.contains(&target) {
+            q.push_back(target);
+        }
+    }
+
+    /// Proxy -> WM: consume one pending X11 data request.
+    pub fn take_clipboard_request(&self) -> Option<String> {
+        lock(&self.clipboard_requests).pop_front()
     }
 }
 
@@ -356,6 +446,24 @@ mod tests {
 
         bridge.set_screen_size(1920, 1080);
         assert_eq!(bridge.screen_size(), (1920, 1080));
+    }
+
+    #[test]
+    fn output_rects_are_flattened_and_deduplicated() {
+        let (bridge, _rx) = X11Bridge::new();
+        assert_eq!(bridge.output_rects_snapshot(), (0, vec![]));
+        bridge.set_output_rects(&[(0, 0, 1920, 1080), (1920, 0, 1280, 720)]);
+        let (gen, rects) = bridge.output_rects_snapshot();
+        assert_eq!(gen, 1);
+        assert_eq!(rects, vec![0, 0, 1920, 1080, 1920, 0, 1280, 720]);
+        // Re-publishing the same layout must not make the WM rewrite the
+        // X11 property on every wl_output event.
+        bridge.set_output_rects(&[(0, 0, 1920, 1080), (1920, 0, 1280, 720)]);
+        assert_eq!(bridge.output_rects_snapshot().0, 1);
+        bridge.set_output_rects(&[(0, 0, 2560, 1440)]);
+        let (gen, rects) = bridge.output_rects_snapshot();
+        assert_eq!(gen, 2);
+        assert_eq!(rects, vec![0, 0, 2560, 1440]);
     }
 
     #[test]

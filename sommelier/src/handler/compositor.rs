@@ -22,6 +22,7 @@ use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+use crate::protocols::wayland::wl_surface::REQ_DAMAGE;
 use crate::state::{Context, SurfaceState};
 use crate::wire::Action;
 use log::debug;
@@ -60,6 +61,41 @@ impl WlSurfaceHandler for CompositorHandler {
         });
         surface_state.pending_buffer_id = if buffer == 0 { None } else { Some(buffer) };
         Action::Forward
+    }
+
+    /// `--no-support-damage-buffer`: translate the v4 `damage_buffer` request
+    /// into a v1 `wl_surface.damage` in host coordinates instead of letting an
+    /// untranslated v4 request reach a host that was bound at v3. Conforming
+    /// guests never send it (we cap the advertised version), but GTK/Qt
+    /// versions that cache the global version can still try.
+    fn on_damage_buffer(
+        &mut self,
+        ctx: &mut Context,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Action {
+        if ctx.damage_buffer {
+            return Action::Forward;
+        }
+        let guest_surface = ctx.last_sender_id;
+        let Some(host_surface) = ctx.shadow_table.get_host_id(guest_surface) else {
+            log::debug!(
+                "damage_buffer on unmapped surface {} dropped",
+                guest_surface
+            );
+            return Action::Drop;
+        };
+        let (dx, dy, dw, dh) = ctx.transform.damage_coord(x, y, width, height);
+        let mut builder = crate::wire::MessageBuilder::new();
+        builder.write_i32(dx);
+        builder.write_i32(dy);
+        builder.write_i32(dw);
+        builder.write_i32(dh);
+        let msg = builder.build_message(host_surface, REQ_DAMAGE);
+        ctx.client_to_host_queue.push((msg, Vec::new()));
+        Action::Drop
     }
 
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
@@ -251,6 +287,43 @@ mod tests {
     fn msg_opcode(msg: &[u8]) -> u16 {
         let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
         (word2 & 0xffff) as u16
+    }
+
+    #[test]
+    fn damage_buffer_is_translated_when_support_disabled() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.damage_buffer = false;
+        ctx.transform =
+            crate::transform::Transform::new(1.0, crate::transform::ScalingMode::Normal, vec![]);
+        ctx.shadow_table.map_id(12, 34);
+        ctx.last_sender_id = 12;
+
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_damage_buffer(&mut ctx, 10, 20, 100, 50),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let msg = &ctx.client_to_host_queue[0].0;
+        assert_eq!(msg_sender(msg), 34);
+        assert_eq!(msg_opcode(msg), REQ_DAMAGE);
+        let read = |off: usize| i32::from_ne_bytes(msg[8 + off..12 + off].try_into().unwrap());
+        // damage_coord widens the rectangle by one pixel on each edge to
+        // absorb rounding, exactly like mainline sl_transform_damage_coord.
+        assert_eq!((read(0), read(4), read(8), read(12)), (9, 19, 102, 52));
+    }
+
+    #[test]
+    fn damage_buffer_is_forwarded_when_supported() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(12, 34);
+        ctx.last_sender_id = 12;
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_damage_buffer(&mut ctx, 0, 0, 10, 10),
+            Action::Forward
+        );
+        assert!(ctx.client_to_host_queue.is_empty());
     }
 
     fn setup_ctx() -> (Context, u32, u32, u32) {

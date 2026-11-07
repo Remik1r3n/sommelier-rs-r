@@ -1,0 +1,766 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Wayland-side half of the X11 <-> Wayland selection bridge.
+//!
+//! Mainline sommelier owns both the X11 `CLIPBOARD` selection and a Wayland
+//! `wl_data_device_manager`, so it can translate offers in either direction.
+//! In this proxy the host compositor is a *real* Wayland compositor: guest
+//! requests are forwarded to it. To make X11 applications share the clipboard
+//! we therefore have to do three things on top of plain forwarding:
+//!
+//! 1. **X11 -> guest Wayland**: when the WM reports a new X11 CLIPBOARD owner
+//!    (`set_clipboard_targets`), synthesize a `wl_data_device.data_offer` +
+//!    `offer` + `selection` on every guest data device. A subsequent
+//!    `wl_data_offer.receive` is turned into a `ConvertSelection` request to
+//!    the X11 owner; its bytes are written back into the guest-provided fd.
+//! 2. **host Wayland -> X11**: track host `wl_data_offer`s and prefetch their
+//!    small/text payloads, publishing them as `WmEvent::ClipboardData` so the
+//!    WM can answer X11 `SelectionRequest`s without a synchronous round trip.
+//! 3. **guest Wayland -> X11**: track guest `wl_data_source`s, publish their
+//!    MIME list as TARGETS and prefetch their payload with a compositor-style
+//!    `wl_data_source.send` event.
+//!
+//! All transfers are asynchronous. Large or non-text payloads are deliberately
+//! not prefetched; they are fetched on demand from the X11 owner in direction
+//! (1), while directions (2)/(3) fall back to a deferred `SelectionRequest`
+//! handled by `ClipboardBridge::flush_pending`.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::protocols::wayland::{wl_data_device, wl_data_offer, wl_data_source};
+use crate::state::Context;
+use crate::wire::MessageBuilder;
+use crate::x11::bridge::{WmEvent, X11Bridge};
+
+/// Upper bound for a prefetched payload. Bigger blobs are left to the
+/// on-demand X11 ConvertSelection path / INCR transfer.
+const PREFETCH_LIMIT: usize = 4 * 1024 * 1024;
+/// How long a `wl_data_offer.receive` waits for ConvertSelection data.
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Keep at most this many synthetic offers alive per connection.
+const MAX_X11_OFFERS: usize = 8;
+
+/// Map a Wayland MIME type to the X11 atom an X11 selection owner is most
+/// likely to serve. X11 owners rarely intern literal MIME names.
+pub fn x11_target_for_mime(mime: &str) -> String {
+    let m = mime.trim();
+    let lower = m.to_ascii_lowercase();
+    match lower.as_str() {
+        "utf8_string"
+        | "string"
+        | "text"
+        | "compound_text"
+        | "text/plain"
+        | "text/plain;charset=utf-8"
+        | "text/plain;charset=utf-8;"
+        | "text/plain;charset=us-ascii" => "UTF8_STRING".to_string(),
+        _ => m.to_string(),
+    }
+}
+
+/// Map an X11 TARGETS atom back to a Wayland MIME type. Returns an empty
+/// string for control atoms that must never become an offered MIME type.
+pub fn mime_for_x11_target(target: &str) -> String {
+    match target {
+        "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "SAVE_TARGETS" | "WL_SELECTION" => String::new(),
+        "UTF8_STRING" | "STRING" | "TEXT" | "COMPOUND_TEXT" => {
+            "text/plain;charset=utf-8".to_string()
+        }
+        _ => target.to_string(),
+    }
+}
+
+/// X11 targets an X11 requestor should see in `TARGETS`, derived from a
+/// Wayland MIME list. Text MIMEs always get the classic Latin-1/UTF-8 atoms
+/// as aliases because most X11 toolkits only ask for those.
+pub fn normalize_targets(mimes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = vec![
+        "UTF8_STRING".into(),
+        "STRING".into(),
+        "TEXT".into(),
+        "TARGETS".into(),
+        "TIMESTAMP".into(),
+    ];
+    for mime in mimes {
+        for candidate in [x11_target_for_mime(mime), mime_for_x11_target(mime)] {
+            if !candidate.is_empty() && !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+fn is_prefetchable(mime: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    m.starts_with("text/")
+        || matches!(
+            m.as_str(),
+            "utf8_string"
+                | "string"
+                | "text"
+                | "compound_text"
+                | "image/png"
+                | "image/jpeg"
+                | "image/bmp"
+                | "application/json"
+        )
+}
+
+#[derive(Debug, Clone)]
+struct X11Offer {
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HostOffer {
+    host_id: u32,
+    mimes: Vec<String>,
+}
+
+struct PendingReceive {
+    /// X11 atom name requested from the WM.
+    target: String,
+    fd: OwnedFd,
+    deadline: Instant,
+}
+
+/// Per-Wayland-connection clipboard state. Stored behind
+/// `Arc<Mutex<..>>` in `Context` so handlers can hold `&mut Context` at the
+/// same time (see `Context::selection`).
+pub struct SelectionBridge {
+    bridge: Option<Arc<X11Bridge>>,
+    /// Guest `wl_data_device` object ids created by `get_data_device`.
+    data_devices: HashSet<u32>,
+    /// Guest `wl_data_source` id -> offered MIME types.
+    sources: HashMap<u32, Vec<String>>,
+    active_source: Option<u32>,
+    /// Guest offer ids we synthesized for the X11 CLIPBOARD selection.
+    x11_offers: VecDeque<(u32, X11Offer)>,
+    /// Guest offer id -> host offer state (from host `data_offer` events).
+    host_offers: HashMap<u32, HostOffer>,
+    active_host_offer: Option<u32>,
+    pending_receives: Vec<PendingReceive>,
+    last_targets_generation: u64,
+    /// (source kind, MIME) pairs already prefetched in this selection epoch,
+    /// used to avoid re-issuing `receive`/`send` on every poll.
+    prefetched: HashSet<String>,
+}
+
+impl Default for SelectionBridge {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl SelectionBridge {
+    pub fn new(bridge: Option<Arc<X11Bridge>>) -> Self {
+        Self {
+            bridge,
+            data_devices: HashSet::new(),
+            sources: HashMap::new(),
+            active_source: None,
+            x11_offers: VecDeque::new(),
+            host_offers: HashMap::new(),
+            active_host_offer: None,
+            pending_receives: Vec::new(),
+            last_targets_generation: 0,
+            prefetched: HashSet::new(),
+        }
+    }
+
+    /// Attach the shared X11 bridge once `Context::apply_runtime` knows it.
+    pub fn set_bridge(&mut self, bridge: Option<Arc<X11Bridge>>) {
+        self.bridge = bridge;
+    }
+
+    #[allow(dead_code)]
+    pub fn is_active(&self) -> bool {
+        self.bridge.is_some()
+    }
+
+    // ----- guest request tracking (client -> host direction) -----
+
+    /// `wl_data_device_manager.get_data_device(id, ..)`.
+    pub fn track_data_device(&mut self, id: u32) {
+        self.data_devices.insert(id);
+    }
+
+    /// `wl_data_device_manager.create_data_source(id)`.
+    pub fn track_source(&mut self, id: u32) {
+        self.sources.entry(id).or_default();
+    }
+
+    /// `wl_data_source.offer(mime_type)`.
+    pub fn source_offer(&mut self, sender: u32, mime: &str) {
+        self.sources
+            .entry(sender)
+            .or_default()
+            .push(mime.to_string());
+    }
+
+    /// `wl_data_device.set_selection(source, serial)`.
+    pub fn set_selection(&mut self, ctx: &mut Context, source: u32, _serial: u32) {
+        self.active_source = (source != 0).then_some(source);
+        let mimes = self
+            .active_source
+            .and_then(|s| self.sources.get(&s))
+            .cloned()
+            .unwrap_or_default();
+        self.prefetched.clear();
+        let Some(bridge) = self.bridge.clone() else {
+            return;
+        };
+        bridge.push_event(WmEvent::ClipboardTargets {
+            targets: normalize_targets(&mimes),
+        });
+        if let Some(source) = self.active_source {
+            for mime in &mimes {
+                if is_prefetchable(mime) && self.prefetched.insert(format!("source:{mime}")) {
+                    prefetch_from_guest_source(
+                        ctx,
+                        source,
+                        mime,
+                        &x11_target_for_mime(mime),
+                        bridge.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `wl_data_source.destroy(source)`.
+    pub fn source_destroyed(&mut self, sender: u32) {
+        self.sources.remove(&sender);
+        if self.active_source == Some(sender) {
+            self.active_source = None;
+        }
+    }
+
+    // ----- host event tracking (host -> client direction) -----
+
+    /// A host `wl_data_device.data_offer` was remapped by
+    /// `handler/data_device.rs`; remember the guest<->host pair.
+    pub fn on_host_data_offer(&mut self, guest_offer: u32, host_offer: u32) {
+        self.host_offers.insert(
+            guest_offer,
+            HostOffer {
+                host_id: host_offer,
+                mimes: Vec::new(),
+            },
+        );
+    }
+
+    /// A host `wl_data_offer.offer(mime)` event arrived.
+    pub fn on_host_offer_mime(&mut self, ctx: &Context, mime: &str) {
+        let host_sender = ctx.last_sender_id;
+        let Some(guest_offer) = ctx.shadow_table.get_guest_id(host_sender) else {
+            return;
+        };
+        if let Some(offer) = self.host_offers.get_mut(&guest_offer) {
+            if !offer.mimes.contains(&mime.to_string()) {
+                offer.mimes.push(mime.to_string());
+            }
+        }
+    }
+
+    /// A host `wl_data_device.selection(id)` event arrived. `id` is a host
+    /// object id (or 0); the generated forward path rewrites it for the guest,
+    /// so this handler only records state and returns `Action::Forward`.
+    pub fn on_host_selection(&mut self, ctx: &mut Context, host_offer: u32) {
+        if host_offer == 0 {
+            self.active_host_offer = None;
+            return;
+        }
+        let guest_offer = ctx
+            .shadow_table
+            .get_guest_id(host_offer)
+            .unwrap_or(host_offer);
+        self.active_host_offer = Some(guest_offer);
+        let mimes = self
+            .host_offers
+            .get(&guest_offer)
+            .map(|o| o.mimes.clone())
+            .unwrap_or_default();
+        self.prefetched.clear();
+        let Some(bridge) = self.bridge.clone() else {
+            return;
+        };
+        bridge.push_event(WmEvent::ClipboardTargets {
+            targets: normalize_targets(&mimes),
+        });
+        for mime in &mimes {
+            if is_prefetchable(mime) && self.prefetched.insert(format!("host:{mime}")) {
+                let host_id = self
+                    .host_offers
+                    .get(&guest_offer)
+                    .map(|o| o.host_id)
+                    .unwrap_or(host_offer);
+                prefetch_from_host_offer(
+                    ctx,
+                    host_id,
+                    mime,
+                    &x11_target_for_mime(mime),
+                    bridge.clone(),
+                );
+            }
+        }
+    }
+
+    // ----- X11 -> guest Wayland transfer -----
+
+    /// `wl_data_offer.receive(mime, fd)` on one of our synthetic X11 offers.
+    /// Returns `true` when the request was consumed (the caller must Drop it).
+    pub fn receive_x11_offer(
+        &mut self,
+        _ctx: &Context,
+        guest_offer: u32,
+        mime: &str,
+        fd: RawFd,
+    ) -> bool {
+        let Some((_, offer)) = self.x11_offers.iter().find(|(id, _)| *id == guest_offer) else {
+            return false;
+        };
+        if !offer.targets.iter().any(|t| t == mime) {
+            return false;
+        }
+        let Some(bridge) = &self.bridge else {
+            return false;
+        };
+        // The proxy closes the original SCM_RIGHTS fd after dispatch, so keep
+        // our own duplicate for the asynchronous write-back.
+        let Ok(owned) = nix::unistd::dup(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }) else {
+            return false;
+        };
+        let target = x11_target_for_mime(mime);
+        self.pending_receives.push(PendingReceive {
+            target: target.clone(),
+            fd: owned,
+            deadline: Instant::now() + RECEIVE_TIMEOUT,
+        });
+        bridge.push_event(WmEvent::RequestClipboardData { target });
+        true
+    }
+
+    /// Called after every batch of Wayland messages (and on a timer while
+    /// idle) to publish X11 selection changes and finish pending transfers.
+    pub fn poll(&mut self, ctx: &mut Context) {
+        let Some(bridge) = self.bridge.clone() else {
+            return;
+        };
+
+        // 1. Internal WM notifications (owner changes). Stale pending reads
+        //    must not be fulfilled with the previous owner's bytes.
+        let mut owner_changed = false;
+        while let Some((tag, _payload)) = bridge.take_clipboard_data() {
+            if tag.starts_with("x-sommelier/") {
+                owner_changed = true;
+            }
+        }
+        if owner_changed {
+            self.pending_receives.clear();
+            self.pending_targets_clear();
+        }
+
+        // 2. New TARGETS from the X11 owner -> synthetic guest offers.
+        let (generation, targets) = bridge.clipboard_targets_snapshot();
+        if generation != self.last_targets_generation {
+            self.last_targets_generation = generation;
+            if let Some(targets) = targets {
+                self.publish_x11_targets(ctx, &targets);
+            }
+        }
+
+        // 3. Complete receive() calls whose ConvertSelection finished.
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.pending_receives.len() {
+            if self.pending_receives[i].deadline <= now {
+                self.pending_receives.remove(i);
+                continue;
+            }
+            let target = self.pending_receives[i].target.clone();
+            if let Some(data) = bridge.clipboard_data_for(&target) {
+                let pending = self.pending_receives.remove(i);
+                spawn_write(pending.fd, data);
+            } else {
+                i += 1;
+            }
+        }
+
+        // 4. WM -> proxy: an X11 SelectionRequest needs bytes we do not have.
+        while let Some(target) = bridge.take_clipboard_request() {
+            self.fetch_for_x11(ctx, &target);
+        }
+    }
+
+    fn pending_targets_clear(&mut self) {
+        self.prefetched.clear();
+    }
+
+    fn publish_x11_targets(&mut self, ctx: &mut Context, targets: &[String]) {
+        let mut mimes: Vec<String> = Vec::new();
+        for target in targets {
+            let mime = mime_for_x11_target(target);
+            if !mime.is_empty() && !mimes.contains(&mime) {
+                mimes.push(mime);
+            }
+        }
+        if mimes.is_empty() || self.data_devices.is_empty() {
+            return;
+        }
+        for &device in &self.data_devices {
+            let offer_id = ctx.shadow_table.allocate_guest_server_id();
+            ctx.shadow_table
+                .track_interface(offer_id, "wl_data_offer".to_string());
+
+            let mut b = MessageBuilder::new();
+            b.write_u32(offer_id);
+            ctx.host_to_client_queue.push((
+                b.build_message(device, wl_data_device::EVT_DATA_OFFER as u16),
+                Vec::new(),
+            ));
+            for mime in &mimes {
+                let mut ob = MessageBuilder::new();
+                ob.write_string(mime);
+                ctx.host_to_client_queue.push((
+                    ob.build_message(offer_id, wl_data_offer::EVT_OFFER as u16),
+                    Vec::new(),
+                ));
+            }
+            let mut sb = MessageBuilder::new();
+            sb.write_u32(offer_id);
+            ctx.host_to_client_queue.push((
+                sb.build_message(device, wl_data_device::EVT_SELECTION as u16),
+                Vec::new(),
+            ));
+
+            self.x11_offers.push_back((
+                offer_id,
+                X11Offer {
+                    targets: mimes.clone(),
+                },
+            ));
+            while self.x11_offers.len() > MAX_X11_OFFERS {
+                self.x11_offers.pop_front();
+            }
+        }
+        log::debug!(
+            "x11: published CLIPBOARD offer with {} MIME types to {} guest data devices",
+            mimes.len(),
+            self.data_devices.len()
+        );
+    }
+
+    /// Fetch `target` (an X11 atom name) from the active Wayland offer/source
+    /// so a deferred X11 `SelectionRequest` can be answered.
+    fn fetch_for_x11(&mut self, ctx: &mut Context, target: &str) {
+        let Some(bridge) = self.bridge.clone() else {
+            return;
+        };
+        let wanted = x11_target_for_mime(&mime_for_x11_target(target));
+        if let Some(guest_offer) = self.active_host_offer {
+            let offer = self.host_offers.get(&guest_offer).cloned();
+            if let Some(offer) = offer {
+                let mime = offer
+                    .mimes
+                    .iter()
+                    .find(|m| x11_target_for_mime(m) == wanted || *m == target)
+                    .cloned();
+                if let Some(mime) = mime {
+                    if self.prefetched.insert(format!("fetch:{target}")) {
+                        prefetch_from_host_offer(ctx, offer.host_id, &mime, target, bridge.clone());
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(source) = self.active_source {
+            let mimes = self.sources.get(&source).cloned().unwrap_or_default();
+            let mime = mimes
+                .iter()
+                .find(|m| x11_target_for_mime(m) == wanted || *m == target)
+                .cloned();
+            if let Some(mime) = mime {
+                if self.prefetched.insert(format!("fetch:{target}")) {
+                    prefetch_from_guest_source(ctx, source, &mime, target, bridge.clone());
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Asynchronous fd plumbing.
+// ---------------------------------------------------------------------------
+
+/// Create a pipe the *host compositor* can write into, returning the local
+/// read end and a raw fd to hand to the host. virtio_wl needs its own ioctl
+/// based pipe; a local/unix compositor can use a plain `pipe(2)`.
+fn host_read_pipe(ctx: &Context) -> Option<(OwnedFd, RawFd)> {
+    if let Some(virtwl) = &ctx.virtwayland_channel {
+        match virtwl.create_pipe(true) {
+            Ok(read) => match read.try_clone() {
+                Ok(dup) => Some((read, dup.into_raw_fd())),
+                Err(e) => {
+                    log::warn!("x11: dup virtwl clipboard pipe failed: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                log::warn!("x11: virtwl clipboard pipe failed: {}", e);
+                None
+            }
+        }
+    } else {
+        match nix::unistd::pipe() {
+            Ok((read, write)) => Some((read, write.into_raw_fd())),
+            Err(e) => {
+                log::warn!("x11: clipboard pipe failed: {}", e);
+                None
+            }
+        }
+    }
+}
+
+/// Read a pipe to EOF and hand the bytes to the WM as `ClipboardData`.
+fn spawn_collect(read: OwnedFd, target: String, bridge: Arc<X11Bridge>) {
+    // Unit tests (and any non-tokio caller) have no runtime: read the pipe
+    // synchronously rather than panicking inside tokio::spawn.
+    if tokio::runtime::Handle::try_current().is_err() {
+        use std::io::Read;
+        let file = std::fs::File::from(read);
+        let mut buf = Vec::new();
+        let _ = file.take(PREFETCH_LIMIT as u64 + 1).read_to_end(&mut buf);
+        if buf.len() <= PREFETCH_LIMIT {
+            bridge.push_event(WmEvent::ClipboardData { target, data: buf });
+        }
+        return;
+    }
+    tokio::spawn(async move {
+        let mut file = tokio::fs::File::from_std(std::fs::File::from(read));
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match file.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if buf.len() + n > PREFETCH_LIMIT {
+                        log::warn!(
+                            "x11: clipboard payload for {} exceeded prefetch limit, dropping",
+                            target
+                        );
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+        bridge.push_event(WmEvent::ClipboardData { target, data: buf });
+    });
+}
+
+/// Write ConvertSelection bytes into the fd a guest supplied to
+/// `wl_data_offer.receive`.
+fn spawn_write(fd: OwnedFd, data: Vec<u8>) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        use std::io::Write as _;
+        let mut file = std::fs::File::from(fd);
+        let _ = file.write_all(&data);
+        return;
+    }
+    tokio::spawn(async move {
+        let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
+        if let Err(e) = file.write_all(&data).await {
+            log::warn!("x11: writing clipboard data to guest fd failed: {}", e);
+        }
+        let _ = file.flush().await;
+    });
+}
+
+/// Ask a host `wl_data_offer` for `mime`, then publish the result under
+/// `reply_target` for X11 requestors.
+fn prefetch_from_host_offer(
+    ctx: &mut Context,
+    host_offer: u32,
+    mime: &str,
+    reply_target: &str,
+    bridge: Arc<X11Bridge>,
+) {
+    let Some((read, send_fd)) = host_read_pipe(ctx) else {
+        return;
+    };
+    let mut b = MessageBuilder::new();
+    b.write_string(mime);
+    let msg = b.build_message(host_offer, wl_data_offer::REQ_RECEIVE as u16);
+    ctx.client_to_host_queue.push((msg, vec![send_fd]));
+    spawn_collect(read, reply_target.to_string(), bridge);
+}
+
+/// Ask a guest `wl_data_source` for `mime` by sending the compositor-style
+/// `send` event, then publish the result under `reply_target`.
+fn prefetch_from_guest_source(
+    ctx: &mut Context,
+    guest_source: u32,
+    mime: &str,
+    reply_target: &str,
+    bridge: Arc<X11Bridge>,
+) {
+    let Ok((read, write)) = nix::unistd::pipe() else {
+        return;
+    };
+    let mut b = MessageBuilder::new();
+    b.write_string(mime);
+    let msg = b.build_message(guest_source, wl_data_source::EVT_SEND as u16);
+    ctx.host_to_client_queue
+        .push((msg, vec![write.into_raw_fd()]));
+    spawn_collect(read, reply_target.to_string(), bridge);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn mime_target_mapping_roundtrip() {
+        assert_eq!(
+            x11_target_for_mime("text/plain;charset=utf-8"),
+            "UTF8_STRING"
+        );
+        assert_eq!(x11_target_for_mime("STRING"), "UTF8_STRING");
+        assert_eq!(x11_target_for_mime("image/png"), "image/png");
+        assert_eq!(
+            mime_for_x11_target("UTF8_STRING"),
+            "text/plain;charset=utf-8"
+        );
+        assert_eq!(mime_for_x11_target("TARGETS"), "");
+        assert_eq!(mime_for_x11_target("image/png"), "image/png");
+    }
+
+    #[test]
+    fn normalize_targets_has_classic_atoms_and_no_duplicates() {
+        let t = normalize_targets(&[
+            "text/plain;charset=utf-8".into(),
+            "text/plain;charset=utf-8".into(),
+            "image/png".into(),
+        ]);
+        assert_eq!(t[0], "UTF8_STRING");
+        assert!(t.contains(&"image/png".to_string()));
+        assert_eq!(
+            t.iter().filter(|x| *x == "image/png").count(),
+            1,
+            "targets must be deduplicated"
+        );
+    }
+
+    #[test]
+    fn only_small_textual_payloads_are_prefetched() {
+        assert!(is_prefetchable("text/plain;charset=utf-8"));
+        assert!(is_prefetchable("UTF8_STRING"));
+        assert!(is_prefetchable("image/png"));
+        assert!(!is_prefetchable("application/octet-stream"));
+        assert!(!is_prefetchable("video/mp4"));
+    }
+
+    #[test]
+    fn synthetic_offer_is_emitted_for_every_data_device() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.selection.lock().unwrap().set_bridge(Some(bridge));
+        let mut sel = std::mem::take(&mut *ctx.selection.lock().unwrap());
+        sel.track_data_device(7);
+        sel.track_data_device(9);
+        bridge_set_targets(&sel, &["UTF8_STRING".into(), "image/png".into()]);
+        sel.poll(&mut ctx);
+
+        // 2 devices * (data_offer + 2 offers + selection) = 8 events.
+        assert_eq!(ctx.host_to_client_queue.len(), 8);
+        let first = &ctx.host_to_client_queue[0].0;
+        let sender = u32::from_ne_bytes(first[0..4].try_into().unwrap());
+        assert!(sender == 7 || sender == 9);
+        let opcode = (u32::from_ne_bytes(first[4..8].try_into().unwrap()) & 0xffff) as u16;
+        assert_eq!(opcode, wl_data_device::EVT_DATA_OFFER as u16);
+        *ctx.selection.lock().unwrap() = sel;
+    }
+
+    #[test]
+    fn receive_on_synthetic_offer_requests_convert_selection() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.selection
+            .lock()
+            .unwrap()
+            .set_bridge(Some(bridge.clone()));
+        let mut sel = std::mem::take(&mut *ctx.selection.lock().unwrap());
+        sel.track_data_device(7);
+        bridge.set_clipboard_targets(vec!["UTF8_STRING".into()]);
+        sel.poll(&mut ctx);
+
+        let offer_id = u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap());
+        let (read, write) = nix::unistd::pipe().unwrap();
+        assert!(sel.receive_x11_offer(
+            &ctx,
+            offer_id,
+            "text/plain;charset=utf-8",
+            write.as_raw_fd(),
+        ));
+        assert_eq!(sel.pending_receives.len(), 1);
+        match bridge.try_recv_event() {
+            Some(WmEvent::RequestClipboardData { target }) => {
+                assert_eq!(target, "UTF8_STRING")
+            }
+            other => panic!("unexpected WmEvent: {:?}", other),
+        }
+        drop(read);
+        *ctx.selection.lock().unwrap() = sel;
+    }
+
+    #[test]
+    fn pending_receive_is_fulfilled_from_convert_selection_cache() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut sel = SelectionBridge::new(Some(bridge.clone()));
+        sel.track_data_device(7);
+        bridge.set_clipboard_targets(vec!["UTF8_STRING".into()]);
+        sel.poll(&mut ctx);
+        let offer_id = u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap());
+        let (read, write) = nix::unistd::pipe().unwrap();
+        assert!(sel.receive_x11_offer(
+            &ctx,
+            offer_id,
+            "text/plain;charset=utf-8",
+            write.as_raw_fd(),
+        ));
+        bridge.set_clipboard_data("UTF8_STRING".into(), b"hello".to_vec());
+        sel.poll(&mut ctx);
+        assert!(sel.pending_receives.is_empty());
+        drop(read);
+    }
+
+    /// Helper: publish targets through the bridge held by `sel`.
+    fn bridge_set_targets(sel: &SelectionBridge, targets: &[String]) {
+        if let Some(b) = &sel.bridge {
+            b.set_clipboard_targets(targets.to_vec());
+        }
+    }
+}

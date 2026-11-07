@@ -68,13 +68,10 @@ pub struct X11Options {
     pub shm: bool,
     pub scale: f64,
     pub app_id_prefix: String,
-    // Carried through to the WM for future frame drawing / RandR emulation.
-    // Parsed for mainline CLI compatibility; see docs/FEATURES.md.
-    #[allow(dead_code)]
+    // X11 frame colour (X11 0xRRGGBB) and RandR emulation, both applied by
+    // the WM thread; see `wm.rs::border_color` / `update_randr_emu`.
     pub frame_color: String,
-    #[allow(dead_code)]
     pub dark_frame_color: String,
-    #[allow(dead_code)]
     pub allow_randr_emu: bool,
 }
 

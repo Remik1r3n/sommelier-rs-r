@@ -112,7 +112,23 @@ impl OutputHandler {
         }
         // Deterministic ordering: top-to-bottom, then left-to-right.
         outputs.sort_by_key(|o| (o.y, o.x));
+
+        // Feed the same layout to the X11 WM so it can write
+        // _XWAYLAND_RANDR_EMU_MONITOR_RECTS (RandR emulation for X11 apps).
+        let rects: Vec<(i32, i32, i32, i32)> = outputs
+            .iter()
+            .map(|o| {
+                let (x, y) = ctx.transform.host_to_guest(o.x, o.y);
+                let (w, h) = ctx
+                    .transform
+                    .host_to_guest_size(o.physical_width, o.physical_height);
+                (x, y, w.max(1), h.max(1))
+            })
+            .collect();
         ctx.transform.set_outputs(outputs);
+        if let Some(bridge) = &ctx.x11_bridge {
+            bridge.set_output_rects(&rects);
+        }
     }
 }
 

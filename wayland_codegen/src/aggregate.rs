@@ -34,6 +34,25 @@ const INTERNAL_ONLY: &[&str] = &[
     // ChromeOS shelf integration: bound internally, translated into
     // xdg_toplevel.set_app_id / zaura_surface.set_application_id.
     "aura_shell",
+    // Globals that registry.rs hides from the guest (INTERNAL_GLOBALS) and
+    // binds on the host side only. Any host event addressed to these objects
+    // carries a host object id the guest has never seen; forwarding it would
+    // inject a bogus object into the guest connection.
+    "drm",
+    "gtk",
+    "zwp_linux_explicit_synchronization_unstable_v1",
+    "linux_drm_syncobj_v1",
+    "stylus_unstable_v2",
+    "gaming_input_unstable_v2",
+    "text_input_crostini_unstable_v1",
+    "text_input_x11_unstable_v1",
+    "keyboard_extension_unstable_v1",
+    // Deliberately NOT internal-only:
+    //  * text_input_unstable_v1 / text_input_extension_unstable_v1 have
+    //    hand-written host-event handlers that translate v1 events into
+    //    guest text-input-v3 events. Dropping them would break the IME.
+    //  * linux_dmabuf_v1 / viewporter / tablet_unstable_v2 are advertised
+    //    to and bound by guests normally.
 ];
 
 /// Protocols for which `proxy.rs` already provides hand-written delegation

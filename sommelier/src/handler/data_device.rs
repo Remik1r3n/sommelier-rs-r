@@ -14,6 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Data device / clipboard handling.
+//!
+//! Three concerns live here:
+//!  * `event new_id` remapping for host-created `wl_data_offer` objects;
+//!  * the virtio_wl cross-VM pipe used by `wl_data_offer.receive`;
+//!  * the X11 <-> Wayland selection bridge in `x11/selection.rs`, which turns
+//!    X11 CLIPBOARD owners into synthetic guest offers and prefetches Wayland
+//!    payloads for X11 `SelectionRequest`s.
+
 use crate::protocols::wayland::wl_data_device;
 use crate::protocols::wayland::wl_data_device_manager;
 use crate::protocols::wayland::wl_data_offer;
@@ -25,13 +34,28 @@ use std::os::unix::io::IntoRawFd;
 
 pub struct DataDeviceHandler;
 
+/// Run `f` with the per-connection selection state without aliasing `ctx`.
+/// `Context::selection` is an `Arc<Mutex<..>>` precisely so handlers can still
+/// pass the whole `Context` (queues, shadow table, virtwl channel) into the
+/// bridge methods.
+fn with_selection<R>(
+    ctx: &mut Context,
+    f: impl FnOnce(&mut crate::x11::SelectionBridge, &mut Context) -> R,
+) -> R {
+    let arc = ctx.selection.clone();
+    let mut guard = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard, ctx)
+}
+
 impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {
-    fn on_create_data_source(&mut self, _ctx: &mut Context, id: u32) -> Action {
+    fn on_create_data_source(&mut self, ctx: &mut Context, id: u32) -> Action {
         debug!("Tracking data source id={}", id);
+        with_selection(ctx, |sel, _| sel.track_source(id));
         Action::Forward
     }
 
-    fn on_get_data_device(&mut self, _ctx: &mut Context, _id: u32, _seat: u32) -> Action {
+    fn on_get_data_device(&mut self, ctx: &mut Context, id: u32, _seat: u32) -> Action {
+        with_selection(ctx, |sel, _| sel.track_data_device(id));
         Action::Forward
     }
 }
@@ -56,6 +80,7 @@ impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {
             .track_interface(guest_id, "wl_data_offer".to_string());
         ctx.shadow_table
             .track_host_interface(host_id, "wl_data_offer".to_string());
+        with_selection(ctx, |sel, _| sel.on_host_data_offer(guest_id, host_id));
 
         let host_sender_id = ctx.last_sender_id;
         let Some(guest_sender_id) = ctx.shadow_table.get_guest_id(host_sender_id) else {
@@ -73,11 +98,39 @@ impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {
 
         Action::Drop
     }
+
+    /// Host advertised a new selection. The generated forward path rewrites
+    /// the offer id for the guest; we only record it for X11 prefetching.
+    fn on_selection(&mut self, ctx: &mut Context, id: u32) -> Action {
+        with_selection(ctx, |sel, ctx| sel.on_host_selection(ctx, id));
+        Action::Forward
+    }
+
+    /// Guest set its own selection: publish the source's MIME list to X11.
+    fn on_set_selection(&mut self, ctx: &mut Context, source: u32, serial: u32) -> Action {
+        with_selection(ctx, |sel, ctx| sel.set_selection(ctx, source, serial));
+        Action::Forward
+    }
 }
 
 impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
+    /// Host event: one MIME type of a host offer.
+    fn on_offer(&mut self, ctx: &mut Context, mime_type: &str) -> Action {
+        with_selection(ctx, |sel, ctx| sel.on_host_offer_mime(ctx, mime_type));
+        Action::Forward
+    }
+
     fn on_receive(&mut self, ctx: &mut Context, mime_type: &str, fd: i32) -> Action {
         debug!("wl_data_offer.receive: mime_type={}, fd={}", mime_type, fd);
+
+        // Synthetic offer created from the X11 CLIPBOARD selection: the data
+        // comes from an X11 ConvertSelection, not from the host compositor.
+        let guest_offer = ctx.last_sender_id;
+        if with_selection(ctx, |sel, ctx| {
+            sel.receive_x11_offer(ctx, guest_offer, mime_type, fd)
+        }) {
+            return Action::Drop;
+        }
 
         if let Some(virtwl) = &ctx.virtwayland_channel {
             debug!("Using virtwl for clipboard receive");
@@ -158,4 +211,18 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
     }
 }
 
-impl wl_data_source::WlDataSourceHandler for DataDeviceHandler {}
+impl wl_data_source::WlDataSourceHandler for DataDeviceHandler {
+    /// Guest `wl_data_source.offer(mime)` — record the MIME list so X11
+    /// requestors see the right TARGETS.
+    fn on_offer(&mut self, ctx: &mut Context, mime_type: &str) -> Action {
+        let sender = ctx.last_sender_id;
+        with_selection(ctx, |sel, _| sel.source_offer(sender, mime_type));
+        Action::Forward
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+        let sender = ctx.last_sender_id;
+        with_selection(ctx, |sel, _| sel.source_destroyed(sender));
+        Action::Forward
+    }
+}

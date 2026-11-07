@@ -1,10 +1,10 @@
-name: sommelier-rs CI (Debian 13)
+name: sommelier-rs-r CI (Debian 13)
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "master"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "master"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +38,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --component rustfmt,clippy
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Install aarch64 dependencies
@@ -53,12 +54,24 @@ jobs:
         run: |
           rustup target add aarch64-unknown-linux-gnu
 
+      - name: Check formatting
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all -- --check
+
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
-          cargo build --verbose --target ${{ matrix.target }}
+          cargo build --verbose --workspace --target ${{ matrix.target }}
 
-      - name: Run tests (x86_64 only)
+      # The Windows development host can only cross-check (cargo check
+      # --target x86_64-unknown-linux-gnu); running the Linux test binary
+      # happens here, on a real Debian runner.
+      - name: Run unit tests (x86_64 only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --verbose --target ${{ matrix.target }}
+        run: cargo test --verbose --workspace --target ${{ matrix.target }}
+
+      - name: Type-check tests (all targets)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo check --tests --workspace --target ${{ matrix.target }}

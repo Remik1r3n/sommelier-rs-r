@@ -400,6 +400,13 @@ pub struct Context {
     pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
+    /// `--no-support-damage-buffer`: when false, `wl_compositor` is advertised
+    /// (and bound) at version 3 so guests never emit `wl_surface.damage_buffer`
+    /// (added in v4), which the SHM translation layer cannot service.
+    pub damage_buffer: bool,
+    /// `--viewport-resize`: translate `wp_viewport.set_destination` from
+    /// virtual to host-logical coordinates for non-resizable windows.
+    pub viewport_resize: bool,
     /// Host-side zaura_shell object ID (bound internally, not exposed to guest).
     pub host_zaura_shell_id: Option<u32>,
     /// Bound version of zaura_shell (capped at 38 in registry). Used to guard
@@ -417,6 +424,10 @@ pub struct Context {
     // ---- sommelier-rs-r additions (not present in either upstream branch) ----
     /// Shared state with the X11 WM. `None` unless X11 forwarding is enabled.
     pub x11_bridge: Option<Arc<X11Bridge>>,
+    /// Wayland-side clipboard state for this guest connection. Behind an
+    /// `Arc<Mutex<..>>` so request/event handlers can hold `&mut Context`
+    /// while consulting it (a direct field would alias the whole struct).
+    pub selection: Arc<Mutex<crate::x11::SelectionBridge>>,
     /// True for the dedicated Wayland connection used by Xwayland itself.
     pub is_xwayland_client: bool,
     /// Coordinate/DPI scaling state (mainline sommelier-transform / -output).
@@ -492,6 +503,8 @@ impl Context {
             feedback_index_maps: HashMap::new(),
             gpu_accel,
             xdg_decoration,
+            damage_buffer: true,
+            viewport_resize: false,
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
             vm_identifier: std::env::var("SOMMELIER_VM_IDENTIFIER")
@@ -500,6 +513,7 @@ impl Context {
             xdg_surface_to_wl_surface: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),
             x11_bridge: None,
+            selection: Arc::new(Mutex::new(crate::x11::SelectionBridge::default())),
             is_xwayland_client: false,
             transform: Transform::new(1.0, crate::transform::ScalingMode::Normal, vec![]),
             quirks: Arc::new(Quirks::new()),
@@ -519,6 +533,9 @@ impl Context {
     ) {
         self.transform = transform;
         self.quirks = quirks;
+        if let Ok(mut selection) = self.selection.lock() {
+            selection.set_bridge(bridge.clone());
+        }
         self.x11_bridge = bridge;
         self.is_xwayland_client = is_xwayland_client;
     }

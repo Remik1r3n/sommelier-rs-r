@@ -27,6 +27,10 @@ pub struct RegistryHandler;
 /// `protocols::all::KNOWN_INTERFACES` is safe to forward; keeping a deny list
 /// (instead of an allow list) means adding a protocol XML automatically makes
 /// it available without touching this file.
+/// Highest `wl_compositor` version we can expose without supporting
+/// `wl_surface.damage_buffer` (introduced in v4).
+const MAX_COMPOSITOR_VERSION: u32 = 3;
+
 const INTERNAL_GLOBALS: &[&str] = &[
     // ChromeOS aura-shell: bound internally for shelf app-ids.
     "zaura_shell",
@@ -109,8 +113,25 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             );
         }
 
-        if interface == "wl_compositor" {
-            ctx.host_globals.insert("wl_compositor".to_string(), name);
+        if interface == "wl_compositor" && !ctx.damage_buffer && version > MAX_COMPOSITOR_VERSION {
+            // `wl_surface.damage_buffer` was added in wl_compositor v4 and we
+            // cannot translate it for the host. Advertise (and later bind) v3
+            // so a conforming guest never emits the request at all.
+            let registry_guest_id = ctx
+                .shadow_table
+                .get_guest_id(ctx.last_sender_id)
+                .unwrap_or(ctx.last_sender_id);
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(name);
+            builder.write_string(interface);
+            builder.write_u32(MAX_COMPOSITOR_VERSION);
+            let msg = builder.build_message(registry_guest_id, wl_registry::EVT_GLOBAL as u16);
+            ctx.host_to_client_queue.push((msg, Vec::new()));
+            log::debug!(
+                "Capping wl_compositor global at v{} (--no-support-damage-buffer)",
+                MAX_COMPOSITOR_VERSION
+            );
+            return Action::Drop;
         }
 
         if interface == "zwp_linux_dmabuf_v1" {
@@ -283,6 +304,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // id is (interface, version, new_id)
         let (interface, _version, guest_new_id) = id;
 
+        // Keep the host binding in sync with the version we advertised: a
+        // guest that (incorrectly) requests v4+ must not make the host believe
+        // damage_buffer is supported.
+        let bound_version = if interface == "wl_compositor" && !ctx.damage_buffer {
+            (*_version).min(MAX_COMPOSITOR_VERSION)
+        } else {
+            *_version
+        };
+
         if interface == "wl_shm" {
             // Do NOT forward wl_shm to host. We emulate it.
             // Just track it so we know this guest ID is wl_shm.
@@ -332,7 +362,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             let mut builder = MessageBuilder::new();
             builder.write_u32(_name);
             builder.write_string(interface);
-            builder.write_u32(*_version);
+            builder.write_u32(bound_version);
             builder.write_u32(host_new_id);
 
             let full_msg = builder.build_message(registry_host_id, wl_registry::REQ_BIND as u16);
