@@ -1,0 +1,15 @@
+[Unit]
+Description=sommelier-rs-r Wayland/X11 proxy for %i
+Documentation=https://github.com/google/sommelier-rs
+
+[Service]
+Type=simple
+# Add -X to enable X11 forwarding (requires the Xwayland binary from
+# /opt/google/cros-containers/bin/Xwayland). Environment is inherited from
+# the user manager, so SOMMELIER_* variables set via systemctl --user work.
+ExecStart=%h/.local/bin/sommelier-rs-r --transport=auto --virtio-wl /dev/wl0 --sd-notify %i
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

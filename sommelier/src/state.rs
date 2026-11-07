@@ -1,0 +1,662 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::collections::{HashMap, HashSet};
+use std::os::unix::io::{OwnedFd, RawFd};
+use std::sync::{Arc, Mutex, RwLock};
+
+use crate::allocator::Allocator;
+use crate::quirks::Quirks;
+use crate::transform::Transform;
+use crate::virtgpu_channel::VirtGpuChannel;
+use crate::virtwl_channel::VirtWaylandChannel;
+use crate::x11::X11Bridge;
+use log::warn;
+
+/// A Wayland object ID allocated by the **guest** (client) side.
+///
+/// Request handlers (client→host) receive guest IDs. Use [`ShadowTable::host_id_of`]
+/// to translate to the corresponding host ID. Passing a `GuestId` where a `HostId`
+/// is expected (or vice versa) is a **compile error**.
+///
+/// The inner field is intentionally `pub(crate)` so that arbitrary `GuestId(host_id)`
+/// constructions cannot be made from outside this crate, preserving the type invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuestId(pub(crate) u32);
+
+impl GuestId {
+    /// Wrap the raw sender ID from a **client→host request** handler.
+    /// Only call this in handlers where `ctx.last_sender_id` is a guest ID.
+    #[inline]
+    pub(crate) fn from_request_sender(ctx: &Context) -> Self {
+        Self(ctx.last_sender_id)
+    }
+}
+
+/// A Wayland object ID allocated by the **host** compositor side.
+///
+/// Event handlers (host→client) receive host IDs. Use [`ShadowTable::guest_id_of`]
+/// to translate to the corresponding guest ID. Passing a `HostId` where a `GuestId`
+/// is expected (or vice versa) is a **compile error**.
+///
+/// The inner field is intentionally `pub(crate)` so that arbitrary `HostId(guest_id)`
+/// constructions cannot be made from outside this crate, preserving the type invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostId(pub(crate) u32);
+
+impl HostId {
+    /// Wrap the raw sender ID from a **host→client event** handler.
+    /// Only call this in handlers where `ctx.last_sender_id` is a host ID.
+    #[inline]
+    pub(crate) fn from_event_sender(ctx: &Context) -> Self {
+        Self(ctx.last_sender_id)
+    }
+
+    /// Wrap an ID freshly returned by [`ShadowTable::allocate_host_id`].
+    ///
+    /// Using this constructor (rather than the bare `HostId(raw)` tuple syntax)
+    /// makes allocation sites auditable: a code search for `from_allocated` finds
+    /// every place a new host-side object is created.
+    #[inline]
+    pub(crate) fn from_allocated(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+// Each internally-bound interface stores its host ID in a dedicated
+// `ctx.host_*_id` field, and we register it with `track_host_interface`
+// so proxy.rs can dispatch inbound host events without any magic number hackery.
+
+#[allow(dead_code)]
+pub struct ShadowTable {
+    guest_to_host: HashMap<u32, u32>,
+    host_to_guest: HashMap<u32, u32>,
+    interfaces: HashMap<u32, String>,
+    host_interfaces: HashMap<u32, String>,
+    next_host_id: u32,
+    /// Restored from `main`: IDs for objects the *host* creates on its own
+    /// (e.g. `wl_data_device.data_offer`). They live above 0xff000000 so they
+    /// can never collide with guest-allocated IDs.
+    next_guest_server_id: u32,
+}
+
+impl ShadowTable {
+    pub fn new() -> Self {
+        Self {
+            guest_to_host: HashMap::new(),
+            host_to_guest: HashMap::new(),
+            interfaces: HashMap::new(),
+            host_interfaces: HashMap::new(),
+            // Start at 2 to mimic standard Wayland client behavior.
+            // ID 1 is reserved for wl_display.
+            next_host_id: 2,
+            next_guest_server_id: 0xff00_0000,
+        }
+    }
+
+    /// Allocate an ID in the guest namespace for an object created by the host.
+    ///
+    /// Restored from `main` (the `virtwl` branch dropped it). Wayland object IDs
+    /// are connection-local: a `new_id` arriving in a host→client event is a
+    /// *host* ID and must never be handed to the guest verbatim. The generator
+    /// now calls this for every event `new_id`; `data_device.rs` keeps its
+    /// explicit hand-written path for `wl_data_offer`.
+    pub fn allocate_guest_server_id(&mut self) -> u32 {
+        let id = self.next_guest_server_id;
+        self.next_guest_server_id = self.next_guest_server_id.wrapping_add(1);
+        if self.next_guest_server_id == 0 {
+            self.next_guest_server_id = 0xff00_0000;
+        }
+        id
+    }
+
+    pub fn allocate_host_id(&mut self) -> u32 {
+        // In the common case (next_host_id points to a free slot) this returns
+        // on the first iteration. The u64 loop bound caps worst-case work at
+        // u32::MAX iterations to prevent an infinite spin when the ID space is
+        // nearly full, and triggers a panic instead of looping forever.
+        //
+        // We use u64 for the loop variable to avoid an overflow when constructing
+        // the `RangeInclusive<u32>`: writing `0u32..=u32::MAX` would require
+        // computing `u32::MAX + 1` for the exclusive upper bound, which wraps
+        // to 0 and produces an empty range on platforms where range iteration
+        // checks `start > end`. Casting to u64 sidesteps this entirely.
+        for _ in 0u64..=(u32::MAX as u64) {
+            // `id` is the candidate we are testing this iteration.
+            let id = self.next_host_id;
+            // Advance the counter; .max(2) handles the u32::MAX → 0 → 2 wrap
+            // in one step, keeping 0 (null) and 1 (wl_display) permanently skipped.
+            self.next_host_id = self.next_host_id.wrapping_add(1).max(2);
+            // Accept only IDs ≥ 2 that are not already assigned in either map.
+            // `host_to_guest` tracks guest↔host paired objects; `host_interfaces`
+            // tracks internally-bound objects (keyboard extension, dmabuf, etc.)
+            // that are registered via `track_host_interface` without a guest pair.
+            // Both maps must be checked, otherwise a freshly-allocated ID could
+            // collide with an already-registered internal object.
+            //
+            // (The pre-advance id could be 0 or 1 if next_host_id was initialised
+            // to those values externally, e.g. in tests.)
+            if id >= 2
+                && !self.host_to_guest.contains_key(&id)
+                && !self.host_interfaces.contains_key(&id)
+            {
+                return id;
+            }
+        }
+        log::error!("sommelier: host Wayland object ID space exhausted");
+        panic!("sommelier: host Wayland object ID space exhausted — this should never happen");
+    }
+
+    pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
+        if let Some(old_host_id) = self.guest_to_host.insert(guest_id, host_id) {
+            if old_host_id != host_id {
+                self.host_to_guest.remove(&old_host_id);
+            }
+        }
+        self.host_to_guest.insert(host_id, guest_id);
+    }
+
+    pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
+        self.guest_to_host.get(&guest_id).cloned()
+    }
+
+    pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
+        self.host_to_guest.get(&host_id).cloned()
+    }
+
+    pub fn track_interface(&mut self, guest_id: u32, interface: String) {
+        self.interfaces.insert(guest_id, interface);
+    }
+
+    pub fn track_host_interface(&mut self, host_id: u32, interface: String) {
+        self.host_interfaces.insert(host_id, interface);
+    }
+
+    /// Remove a host-side interface registration.
+    ///
+    /// Call this when a host object is destroyed (e.g. `zcr_extended_keyboard_v1.destroy`)
+    /// to prevent stale events for the recycled ID from being dispatched.
+    ///
+    /// # Pipelining note
+    /// The `destroy` request and this registration removal are applied immediately
+    /// on the client side, but the host compositor processes them asynchronously.
+    /// Events for `host_id` that were already queued by the host (e.g. `peek_key`
+    /// in protocol v2+) may arrive after the destroy is sent. Those events will
+    /// be silently dropped by the dispatcher once the registration is gone, which
+    /// is the correct behavior. Exo does not send events after processing `destroy`.
+    pub fn remove_host_interface(&mut self, host_id: u32) {
+        self.host_interfaces.remove(&host_id);
+    }
+
+    pub fn get_interface(&self, guest_id: u32) -> Option<&String> {
+        self.interfaces.get(&guest_id)
+    }
+
+    pub fn get_host_interface(&self, host_id: u32) -> Option<&String> {
+        self.host_interfaces.get(&host_id)
+    }
+
+    /// Typed lookup: translate a guest-allocated object ID to its host counterpart.
+    /// Use in **client→host request** handlers where `ctx.last_sender_id` is a guest ID.
+    pub fn host_id_of(&self, guest: GuestId) -> Option<HostId> {
+        self.guest_to_host.get(&guest.0).map(|&h| HostId(h))
+    }
+
+    /// Typed lookup: translate a host-allocated object ID to its guest counterpart.
+    /// Use in **host→client event** handlers where `ctx.last_sender_id` is a host ID.
+    pub fn guest_id_of(&self, host: HostId) -> Option<GuestId> {
+        self.host_to_guest.get(&host.0).map(|&g| GuestId(g))
+    }
+
+    pub fn remove_id(&mut self, guest_id: u32) {
+        if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
+            self.host_to_guest.remove(&host_id);
+            self.host_interfaces.remove(&host_id);
+        }
+        self.interfaces.remove(&guest_id);
+    }
+
+    #[allow(dead_code)]
+    pub fn find_by_interface(&self, interface_name: &str) -> Vec<u32> {
+        self.interfaces
+            .iter()
+            .filter_map(|(id, name)| {
+                if name == interface_name {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+impl Default for ShadowTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct PoolInner {
+    pub client_ptr: *mut libc::c_void,
+    pub size: usize,
+}
+
+unsafe impl Send for PoolInner {}
+unsafe impl Sync for PoolInner {}
+
+pub struct PoolState {
+    pub client_fd: RawFd,
+    pub inner: RwLock<PoolInner>,
+}
+
+impl Drop for PoolState {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.write() {
+            unsafe {
+                if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
+                    libc::munmap(inner.client_ptr, inner.size);
+                    inner.client_ptr = std::ptr::null_mut();
+                }
+            }
+        }
+        unsafe {
+            if self.client_fd >= 0 {
+                libc::close(self.client_fd);
+            }
+        }
+    }
+}
+
+/// Keeps the backing storage of a host buffer alive for as long as the
+/// `BufferState` exists. Unifies the three allocation strategies that were
+/// split across the two upstream branches.
+#[allow(dead_code)]
+pub enum BufferBacking {
+    /// GBM BO (virtwl branch, needs a render node).
+    Gbm(gbm::BufferObject<()>),
+    /// Sealed memfd (main branch, no /dev/dri dependency).
+    Memfd(OwnedFd),
+    /// virtio-gpu cross-domain blob (main branch).
+    VirtGpuBlob(OwnedFd),
+}
+
+pub struct BufferState {
+    pub pool: Arc<PoolState>,
+    pub offset: i32,
+    #[allow(dead_code)]
+    pub width: i32,
+    pub height: i32,
+    pub stride: u32,
+    #[allow(dead_code)]
+    pub format: u32,
+    #[allow(dead_code)]
+    pub host_buffer_id: u32,
+    #[allow(dead_code)]
+    pub bo: Option<BufferBacking>,
+    #[allow(dead_code)]
+    pub dmabuf_fd: Option<OwnedFd>,
+    pub bo_stride: u32,
+    pub dest_ptr: *mut u8,
+    pub dest_size: usize,
+}
+
+unsafe impl Send for BufferState {}
+unsafe impl Sync for BufferState {}
+
+impl Drop for BufferState {
+    fn drop(&mut self) {
+        if !self.dest_ptr.is_null() && self.dest_ptr as *mut libc::c_void != libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(self.dest_ptr as *mut libc::c_void, self.dest_size);
+                self.dest_ptr = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+pub struct SurfaceState {
+    pub pending_buffer_id: Option<u32>,
+}
+
+pub struct PendingParam {
+    pub fd: RawFd,
+    pub plane_idx: u32,
+    pub offset: u32,
+    pub stride: u32,
+    pub modifier_hi: u32,
+    pub modifier_lo: u32,
+}
+
+pub struct TextInputState {
+    pub host_v1_id: u32,
+    pub host_ext_id: u32,
+    pub guest_seat: u32,
+    pub active_surface: Option<u32>,
+    pub enabled: bool,
+    pub enabled_changed: bool,
+    pub surrounding_text: Option<(String, i32, i32)>,
+    pub content_hint: u32,
+    pub content_purpose: u32,
+    pub cursor_rect: Option<(i32, i32, i32, i32)>,
+    pub text_change_cause: u32,
+}
+
+pub struct Context {
+    pub shadow_table: ShadowTable,
+    pub pools: HashMap<u32, Arc<PoolState>>,
+    pub buffers: HashMap<u32, BufferState>,
+    pub surfaces: HashMap<u32, SurfaceState>,
+    pub text_inputs: HashMap<u32, TextInputState>,
+    pub keyboard_to_seat: HashMap<u32, u32>,
+    pub active_surface_for_seat: HashMap<u32, u32>,
+    /// Raw sender ID of the message currently being dispatched. Kept for
+    /// backwards compatibility: its meaning depends on direction.
+    pub last_sender_id: u32,
+    /// Unambiguous direction-specific sender IDs, written by the generator.
+    pub last_guest_sender_id: u32,
+    pub last_host_sender_id: u32,
+    /// Pending messages to send from client→host (e.g. ack_key, bind requests).
+    pub client_to_host_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
+    /// Pending messages to send from host→client (e.g. synthetic wl_shm.format).
+    pub host_to_client_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
+    pub allocator: Option<Allocator>,
+    /// virtio_wl backend (Crostini). Restored alongside `virtgpu_channel` so a
+    /// single binary can serve both kinds of VMM.
+    pub virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
+    /// virtio-gpu cross-domain backend (crosvm / generic VMM), from `main`.
+    pub virtgpu_channel: Option<Arc<Mutex<VirtGpuChannel>>>,
+    pub host_dmabuf_id: Option<u32>,
+    pub host_shm_id: Option<u32>,
+    pub host_text_input_manager_v1_id: Option<u32>,
+    pub host_text_input_extension_v1_id: Option<u32>,
+    /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
+    pub host_keyboard_extension_id: Option<HostId>,
+    /// Maps host keyboard ID → host extended-keyboard ID for `ack_key`.
+    ///
+    /// Both key and value are [`HostId`]s intentionally — using [`GuestId`] here
+    /// by mistake is a **compile error**, preventing the direction bug where a
+    /// client→host request handler reads `ctx.last_sender_id` (a guest ID) and
+    /// uses it to look up a host-keyed map.
+    pub keyboard_to_extended_keyboard: HashMap<HostId, HostId>,
+    /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
+    pub accelerators: Vec<crate::accelerator::Accelerator>,
+    pub supported_formats: HashSet<u32>,
+    pub host_globals: HashMap<String, u32>,
+    pub pending_params: HashMap<u32, Vec<PendingParam>>,
+    pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
+    pub gpu_accel: bool,
+    pub xdg_decoration: bool,
+    /// Host-side zaura_shell object ID (bound internally, not exposed to guest).
+    pub host_zaura_shell_id: Option<u32>,
+    /// Bound version of zaura_shell (capped at 38 in registry). Used to guard
+    /// opcodes that require specific protocol versions.
+    pub host_zaura_shell_version: u32,
+    /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
+    pub vm_identifier: String,
+    /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
+    pub wl_surface_to_zaura_surface: HashMap<u32, u32>,
+    /// Tracks xdg_surface → wl_surface associations (guest IDs).
+    pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
+    /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
+    pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
+
+    // ---- sommelier-rs-r additions (not present in either upstream branch) ----
+    /// Shared state with the X11 WM. `None` unless X11 forwarding is enabled.
+    pub x11_bridge: Option<Arc<X11Bridge>>,
+    /// True for the dedicated Wayland connection used by Xwayland itself.
+    pub is_xwayland_client: bool,
+    /// Coordinate/DPI scaling state (mainline sommelier-transform / -output).
+    pub transform: Transform,
+    /// Per-application quirks (mainline quirks/quirks.proto).
+    pub quirks: Arc<Quirks>,
+    /// Host `xdg_wm_base` object id, needed by the X11 WM to synthesize
+    /// xdg_surface/xdg_toplevel for X11 top-levels.
+    pub host_xdg_wm_base_id: Option<u32>,
+    /// Host `wl_compositor` object id.
+    pub host_compositor_id: Option<u32>,
+}
+
+impl Context {
+    pub fn new(gpu_accel: bool, xdg_decoration: bool) -> Self {
+        // Initialize allocator
+        let allocator = match Allocator::new() {
+            Ok(alloc) => Some(alloc),
+            Err(e) => {
+                warn!("Failed to initialize GBM allocator: {}", e);
+                None
+            }
+        };
+
+        let accelerators_env = std::env::var("SOMMELIER_ACCELERATORS").unwrap_or_default();
+        let mut accelerators = match crate::accelerator::parse_accelerators(&accelerators_env) {
+            Ok(list) => list,
+            Err(e) => {
+                // A malformed accelerator config should not crash the proxy — that
+                // would break every app in the container. Degrade to no filtering
+                // (all keys forwarded to guest) and log a clear error.
+                warn!(
+                    "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
+                     Accelerator filtering disabled.",
+                    accelerators_env, e
+                );
+                Vec::new()
+            }
+        };
+
+        for def_acc in crate::accelerator::default_accelerators() {
+            if !accelerators.contains(&def_acc) {
+                accelerators.push(def_acc);
+            }
+        }
+
+        Self {
+            shadow_table: ShadowTable::new(),
+            pools: HashMap::new(),
+            buffers: HashMap::new(),
+            surfaces: HashMap::new(),
+            text_inputs: HashMap::new(),
+            keyboard_to_seat: HashMap::new(),
+            active_surface_for_seat: HashMap::new(),
+            last_sender_id: 0,
+            last_guest_sender_id: 0,
+            last_host_sender_id: 0,
+            client_to_host_queue: Vec::new(),
+            host_to_client_queue: Vec::new(),
+            allocator,
+            virtwayland_channel: None,
+            virtgpu_channel: None,
+            host_dmabuf_id: None,
+            host_shm_id: None,
+            host_text_input_manager_v1_id: None,
+            host_text_input_extension_v1_id: None,
+            host_keyboard_extension_id: None,
+            keyboard_to_extended_keyboard: HashMap::new(),
+            accelerators,
+            supported_formats: HashSet::new(),
+            host_globals: HashMap::new(),
+            pending_params: HashMap::new(),
+            feedback_index_maps: HashMap::new(),
+            gpu_accel,
+            xdg_decoration,
+            host_zaura_shell_id: None,
+            host_zaura_shell_version: 0,
+            vm_identifier: std::env::var("SOMMELIER_VM_IDENTIFIER")
+                .unwrap_or_else(|_| "termina".to_string()),
+            wl_surface_to_zaura_surface: HashMap::new(),
+            xdg_surface_to_wl_surface: HashMap::new(),
+            xdg_toplevel_to_wl_surface: HashMap::new(),
+            x11_bridge: None,
+            is_xwayland_client: false,
+            transform: Transform::new(1.0, crate::transform::ScalingMode::Normal, vec![]),
+            quirks: Arc::new(Quirks::new()),
+            host_xdg_wm_base_id: None,
+            host_compositor_id: None,
+        }
+    }
+
+    /// Apply process-wide configuration that is not part of the two-argument
+    /// upstream constructor. Called by the proxy when a client is created.
+    pub fn apply_runtime(
+        &mut self,
+        transform: Transform,
+        quirks: Arc<Quirks>,
+        bridge: Option<Arc<X11Bridge>>,
+        is_xwayland_client: bool,
+    ) {
+        self.transform = transform;
+        self.quirks = quirks;
+        self.x11_bridge = bridge;
+        self.is_xwayland_client = is_xwayland_client;
+    }
+
+    /// Test-only constructor that overrides `SOMMELIER_ACCELERATORS` after construction.
+    ///
+    /// `Context::new` reads `SOMMELIER_ACCELERATORS` from the environment, so
+    /// using it in unit tests would make test outcomes depend on whether the
+    /// developer's shell has that variable set. This constructor calls `new()`
+    /// and then immediately replaces `ctx.accelerators` with the supplied list,
+    /// ensuring tests always run against a known accelerator configuration
+    /// regardless of the environment.
+    #[cfg(test)]
+    pub fn new_for_test(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        accelerators: Vec<crate::accelerator::Accelerator>,
+    ) -> Self {
+        let mut ctx = Self::new(gpu_accel, xdg_decoration);
+        ctx.accelerators = accelerators;
+        ctx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocate_host_id_skips_zero_and_one_after_wrap() {
+        // Verify that when next_host_id wraps from u32::MAX to 0, the allocator
+        // correctly skips the reserved IDs (0 = null, 1 = wl_display) and returns
+        // a valid ID ≥ 2 on both the allocation that reads u32::MAX *and* the
+        // subsequent allocation that reads the post-wrap value.
+        //
+        // Walk-through:
+        //   iter 0: id = u32::MAX, advance → wrapping_add(1)=0, .max(2)=2
+        //           u32::MAX >= 2 and not in map → return u32::MAX  ✓
+        //   (next call) iter 0: id = 2, advance → 3
+        //                       2 >= 2 and not in map → return 2  ✓
+        let mut table = ShadowTable::new();
+        table.next_host_id = u32::MAX;
+
+        let id1 = table.allocate_host_id();
+        assert!(id1 >= 2, "must never return 0 or 1, got {}", id1);
+
+        // The second allocation happens after the counter has wrapped to 2.
+        // It must also return a valid ID and must not collide with id1.
+        let id2 = table.allocate_host_id();
+        assert!(
+            id2 >= 2,
+            "post-wrap allocation must skip reserved IDs, got {}",
+            id2
+        );
+        assert_ne!(id1, id2, "successive allocations must return distinct IDs");
+    }
+
+    #[test]
+    fn allocate_host_id_wraps_correctly() {
+        // Verify that starting with next_host_id = 0 (simulating a state where
+        // the counter was somehow zeroed) results in the first returned ID being
+        // a valid value ≥ 2.
+        //
+        // Walk-through:
+        //   iter 0: id = 0, advance → wrapping_add(1)=1, .max(2)=2
+        //           0 < 2 → skip
+        //   iter 1: id = 2, advance → 3
+        //           2 ≥ 2 and not in map → return 2  ✓
+        let mut table = ShadowTable::new();
+        table.next_host_id = 0;
+        let id = table.allocate_host_id();
+        assert!(
+            id >= 2,
+            "post-zero allocation must skip reserved IDs, got {}",
+            id
+        );
+    }
+
+    /// Regression: allocate_host_id must not re-issue IDs already registered in
+    /// `host_interfaces` (used for internally-bound objects like
+    /// `zcr_keyboard_extension_v1` that have no guest-side counterpart and are
+    /// therefore absent from `host_to_guest`).
+    ///
+    /// Without the `host_interfaces` check the allocator was blind to these IDs
+    /// and could return an ID that is already in use, causing the dispatcher to
+    /// route messages to the wrong handler.
+    #[test]
+    fn allocate_host_id_skips_host_interfaces_entries() {
+        let mut table = ShadowTable::new();
+        // next_host_id starts at 2.
+        // Register IDs 2 and 3 as host-tracked interfaces (no guest pair).
+        table.track_host_interface(2, "zcr_keyboard_extension_v1".to_string());
+        table.track_host_interface(3, "zwp_linux_dmabuf_v1".to_string());
+
+        // The allocator must skip 2 and 3 (in host_interfaces) and return 4.
+        let id = table.allocate_host_id();
+        assert_eq!(
+            id, 4,
+            "allocator must skip IDs registered in host_interfaces, got {}",
+            id
+        );
+        assert!(
+            !table.host_interfaces.contains_key(&id) || id == 4,
+            "returned ID must not be in host_interfaces"
+        );
+    }
+
+    #[test]
+    fn guest_id_and_host_id_raw_round_trip() {
+        // Verify the typed constructors round-trip through the same inner u32.
+        let ctx = Context::new(false, false);
+        let mut ctx = ctx;
+        ctx.last_sender_id = 42;
+        let gid = GuestId::from_request_sender(&ctx);
+        assert_eq!(gid.0, 42);
+
+        ctx.last_sender_id = 99;
+        let hid = HostId::from_event_sender(&ctx);
+        assert_eq!(hid.0, 99);
+    }
+
+    #[test]
+    fn default_accelerators_are_loaded() {
+        let ctx = Context::new(false, false);
+        let defaults = crate::accelerator::default_accelerators();
+        assert!(!defaults.is_empty(), "defaults should not be empty");
+        for def in defaults {
+            assert!(
+                ctx.accelerators.contains(&def),
+                "Context should contain default accelerator {:?}",
+                def
+            );
+        }
+    }
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self::new(false, false)
+    }
+}
