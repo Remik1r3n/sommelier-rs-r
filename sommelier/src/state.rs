@@ -432,6 +432,9 @@ pub struct Context {
     pub is_xwayland_client: bool,
     /// Coordinate/DPI scaling state (mainline sommelier-transform / -output).
     pub transform: Transform,
+    /// Raw `--scale` value (mainline `ctx.desired_scale`). Applied to
+    /// `transform` when the host advertises wp_viewporter.
+    pub desired_scale: f64,
     /// Per-application quirks (mainline quirks/quirks.proto).
     pub quirks: Arc<Quirks>,
     /// Host `xdg_wm_base` object id, needed by the X11 WM to synthesize
@@ -548,6 +551,7 @@ impl Context {
             selection: Arc::new(Mutex::new(crate::x11::SelectionBridge::default())),
             is_xwayland_client: false,
             transform: Transform::new(1.0, crate::transform::ScalingMode::Normal, vec![]),
+            desired_scale: 1.0,
             quirks: Arc::new(Quirks::new()),
             host_xdg_wm_base_id: None,
             host_compositor_id: None,

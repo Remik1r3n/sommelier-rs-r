@@ -34,6 +34,7 @@ use log::{debug, info, warn};
 use x11rb::connection::{Connection as X11Connection, RequestConnection};
 use x11rb::cookie::{Cookie, VoidCookie};
 use x11rb::errors::ConnectionError;
+use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     self, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, ConfigWindow,
     ConfigureNotifyEvent, ConfigureWindowAux, CreateWindowAux, EventMask, Gravity, InputFocus,
@@ -625,7 +626,12 @@ struct WmState {
     /// (xid, guest wl_surface id) pairs awaiting `publish_surface`.
     pending_surface: Vec<(u32, u32)>,
     clipboard: ClipboardBridge,
+    /// `org.chromium.guest_os.<vm>.` (mainline APPLICATION_ID_FORMAT_PREFIX).
     app_id_prefix: String,
+    /// `--application-id` — overrides every derived id.
+    application_id: Option<String>,
+    /// Atom named by `--application-id-x11-property`, interned in `init`.
+    app_id_property_atom: u32,
     shape_enabled: bool,
     quit: bool,
     /// `--allow-xwayland-emulate-screen-pos-size` (RandR emulation).
@@ -650,6 +656,8 @@ impl WmState {
             pending_surface: Vec::new(),
             clipboard: ClipboardBridge::new(selection_window),
             app_id_prefix: opts.app_id_prefix.clone(),
+            application_id: opts.application_id.clone(),
+            app_id_property_atom: 0,
             shape_enabled: opts.enable_xshape,
             quit: false,
             allow_randr_emu: opts.allow_randr_emu,
@@ -709,6 +717,59 @@ impl WmState {
         }
     }
 
+    /// Mainline `sl_update_application_id()` (sommelier-window.cc:1064-1097).
+    ///
+    /// Priority: forced `--application-id` > `xprop.<CARDINAL value>` >
+    /// `wmclass.<WM_CLASS class>` > `wmclientleader.<id>` > `xid.<xid>`.
+    /// The `.wayland.` form is reserved for native Wayland clients.
+    fn build_app_id(
+        &self,
+        xid: u32,
+        class: &str,
+        client_leader: u32,
+        xprop: Option<u32>,
+    ) -> String {
+        if let Some(id) = &self.application_id {
+            if !id.is_empty() {
+                return id.clone();
+            }
+        }
+        if self.app_id_prefix.is_empty() {
+            return class.to_string();
+        }
+        let suffix = if let Some(value) = xprop {
+            format!("xprop.{}", value)
+        } else if !class.is_empty() {
+            format!("wmclass.{}", class)
+        } else if client_leader != 0 {
+            format!("wmclientleader.{}", client_leader)
+        } else {
+            format!("xid.{}", xid)
+        };
+        format!("{}{}", self.app_id_prefix, suffix)
+    }
+
+    /// Read the CARDINAL property named by `--application-id-x11-property`.
+    fn read_app_id_property<C>(&self, conn: &C, xid: u32) -> Option<u32>
+    where
+        C: RequestConnection,
+    {
+        let atom = self.app_id_property_atom;
+        if atom == 0 {
+            return None;
+        }
+        let type_atom = self.atoms.get(X11Atom::Cardinal);
+        let reply = take_reply(
+            xproto::get_property(conn, false, xid, atom, type_atom, 0, 1),
+            "get_property(application-id)",
+        )?;
+        if reply.type_ == 0 {
+            None
+        } else {
+            parse_u32(&reply.value)
+        }
+    }
+
     /// `sl_connect()` setup: event mask, COMPOSITE/XFixes/shape, WM window,
     /// selection owners, `_NET_SUPPORTING_WM_CHECK`, `_NET_SUPPORTED`.
     fn init<C>(&mut self, conn: &C, bridge: &X11Bridge, opts: &X11Options)
@@ -719,6 +780,19 @@ impl WmState {
         // subsequent `&mut self` method calls in the same handler.
         let atoms_snapshot = self.atoms.clone();
         let a = &atoms_snapshot;
+        // `--application-id-x11-property` names a CARDINAL property whose
+        // value becomes part of the app id (sommelier.cc:3251-3256).
+        if let Some(name) = &opts.application_id_property {
+            if !name.is_empty() {
+                match conn.intern_atom(false, name.as_bytes()) {
+                    Ok(cookie) => match cookie.reply() {
+                        Ok(reply) => self.app_id_property_atom = reply.atom,
+                        Err(e) => warn!("x11: intern {} failed: {}", name, e),
+                    },
+                    Err(e) => warn!("x11: intern {} failed: {}", name, e),
+                }
+            }
+        }
         bridge.set_screen_size(self.screen_w, self.screen_h);
 
         let mask = EventMask::STRUCTURE_NOTIFY
@@ -878,9 +952,13 @@ impl WmState {
             "write _NET_WM_NAME",
         );
 
-        // _NET_SUPPORTED: the subset of EWMH we actually implement.
+        // _NET_SUPPORTED: mainline `sl_set_supported` (sommelier.cc:3157-3175)
+        // publishes exactly these eight atoms, in this order. Atoms we
+        // additionally implement are appended afterwards so the mainline
+        // prefix stays byte-identical.
         let supported = [
             X11Atom::NetActiveWindow,
+            X11Atom::NetWmMoveresize,
             X11Atom::NetWmName,
             X11Atom::NetWmState,
             X11Atom::NetWmStateFullscreen,
@@ -888,7 +966,6 @@ impl WmState {
             X11Atom::NetWmStateMaximizedHorz,
             X11Atom::NetWmStateFocused,
             X11Atom::NetFrameExtents,
-            X11Atom::NetWmMoveresize,
             X11Atom::NetSupportingWmCheck,
             X11Atom::NetSupported,
             X11Atom::NetWmWindowType,
@@ -1086,9 +1163,8 @@ impl WmState {
         let pr = self.read_properties(conn, xid);
         let mut xinfo = pr.info;
         xinfo.xid = xid;
-        if !self.app_id_prefix.is_empty() && !xinfo.app_id.is_empty() {
-            xinfo.app_id = format!("{}{}", self.app_id_prefix, xinfo.app_id);
-        }
+        let xprop = self.read_app_id_property(conn, xid);
+        xinfo.app_id = self.build_app_id(xid, &xinfo.wm_class, pr.client_leader, xprop);
 
         // Geometry (skipped when we already have a frame, as in mainline).
         let geometry = take_reply(xproto::get_geometry(conn, xid), "get_geometry");
@@ -1614,20 +1690,10 @@ mod tests {
     #[test]
     fn dark_theme_prefers_dark_frame_color() {
         let opts = X11Options {
-            xwayland_path: "Xwayland".into(),
-            xwayland_cmd_prefix: vec![],
-            x_display: None,
-            x_auth: None,
-            x_font_path: None,
-            gl_driver_path: None,
-            enable_xshape: false,
-            clipboard_manager: true,
-            shm: false,
-            scale: 1.0,
-            app_id_prefix: String::new(),
             frame_color: "#ffffff".into(),
             dark_frame_color: "#202020".into(),
             allow_randr_emu: true,
+            ..X11Options::default()
         };
         let state = WmState::new(1, 1920, 1080, AtomTable::new(), &opts);
         assert!(state.allow_randr_emu);

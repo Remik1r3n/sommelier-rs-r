@@ -61,51 +61,109 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Keep at most this many synthetic offers alive per connection.
 const MAX_X11_OFFERS: usize = 8;
 
-/// Map a Wayland MIME type to the X11 atom an X11 selection owner is most
-/// likely to serve. X11 owners rarely intern literal MIME names.
+/// X11 target name for a Wayland MIME type when asking an *X11 selection
+/// owner* for data.
+///
+/// Mainline (`sl_begin_data_source_send`, `sl_send_data`) interns the MIME
+/// string verbatim as the X11 target. We keep that 1:1 identity and only
+/// add the classic text atoms as extra aliases when *fetching*, because many
+/// X11 owners serve `UTF8_STRING` but never intern a literal MIME name.
 pub fn x11_target_for_mime(mime: &str) -> String {
-    let m = mime.trim();
-    let lower = m.to_ascii_lowercase();
-    match lower.as_str() {
+    mime.trim().to_string()
+}
+
+/// Extra X11 atoms worth trying for a Wayland MIME type. This is a
+/// compatibility superset of mainline: the exported MIME names themselves
+/// are never rewritten.
+pub fn x11_target_aliases(mime: &str) -> Vec<String> {
+    let lower = mime.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
         "utf8_string"
-        | "string"
-        | "text"
-        | "compound_text"
-        | "text/plain"
-        | "text/plain;charset=utf-8"
-        | "text/plain;charset=utf-8;"
-        | "text/plain;charset=us-ascii" => "UTF8_STRING".to_string(),
-        _ => m.to_string(),
+            | "string"
+            | "text"
+            | "compound_text"
+            | "text/plain"
+            | "text/plain;charset=utf-8"
+            | "text/plain;charset=utf-8;"
+            | "text/plain;charset=us-ascii"
+    ) {
+        vec![
+            "UTF8_STRING".to_string(),
+            "STRING".to_string(),
+            "TEXT".to_string(),
+            "text/plain;charset=utf-8".to_string(),
+        ]
+    } else {
+        Vec::new()
     }
 }
 
-/// Map an X11 TARGETS atom back to a Wayland MIME type. Returns an empty
-/// string for control atoms that must never become an offered MIME type.
+/// Best X11 atom to use when *prefetching* a Wayland text MIME from an X11
+/// owner. Mainline would use the literal MIME name; UTF8_STRING is a far more
+/// widely served target, so it is tried first.
+pub fn preferred_x11_target(mime: &str) -> String {
+    x11_target_aliases(mime)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| x11_target_for_mime(mime))
+}
+
+/// All X11 atom names an X11 requestor might ask for that should resolve to
+/// the same Wayland MIME (1:1 name first, aliases afterwards).
+pub fn x11_target_candidates(target: &str) -> Vec<String> {
+    let mut out = vec![target.to_string()];
+    let lower = target.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "utf8_string" | "string" | "text" | "compound_text"
+    ) {
+        out.push("text/plain;charset=utf-8".to_string());
+        out.push("text/plain".to_string());
+    } else if lower.starts_with("text/plain") {
+        out.push("UTF8_STRING".to_string());
+        out.push("STRING".to_string());
+        out.push("TEXT".to_string());
+    }
+    out
+}
+
+/// Map an X11 TARGETS atom back to a Wayland MIME type.
+///
+/// Mainline `sl_get_selection_targets` (sommelier.cc:2819-2841) uses the atom
+/// name verbatim as the `wl_data_source.offer` MIME. Control atoms are never
+/// offered. There is deliberately NO UTF8_STRING -> text/plain conversion:
+/// that would change what the ChromeOS host sees.
 pub fn mime_for_x11_target(target: &str) -> String {
     match target {
-        "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "SAVE_TARGETS" | "WL_SELECTION" => String::new(),
-        "UTF8_STRING" | "STRING" | "TEXT" | "COMPOUND_TEXT" => {
-            "text/plain;charset=utf-8".to_string()
-        }
+        "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "SAVE_TARGETS" | "WL_SELECTION"
+        | "_WL_SELECTION" => String::new(),
         _ => target.to_string(),
     }
 }
 
-/// X11 targets an X11 requestor should see in `TARGETS`, derived from a
-/// Wayland MIME list. Text MIMEs always get the classic Latin-1/UTF-8 atoms
-/// as aliases because most X11 toolkits only ask for those.
+/// X11 targets an X11 requestor should see in `TARGETS`.
+///
+/// Mainline `sl_set_selection` (sommelier.cc:354-371) puts `TARGETS` and
+/// `TIMESTAMP` first, then the MIME names verbatim. We append the classic
+/// text atoms as additional aliases so GTK/Qt/Xt clients keep working; they
+/// never affect the MIME list exported to the host.
 pub fn normalize_targets(mimes: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = vec![
-        "UTF8_STRING".into(),
-        "STRING".into(),
-        "TEXT".into(),
-        "TARGETS".into(),
-        "TIMESTAMP".into(),
-    ];
+    let mut out: Vec<String> = vec!["TARGETS".into(), "TIMESTAMP".into()];
     for mime in mimes {
-        for candidate in [x11_target_for_mime(mime), mime_for_x11_target(mime)] {
-            if !candidate.is_empty() && !out.contains(&candidate) {
-                out.push(candidate);
+        let name = mime.trim();
+        if !name.is_empty() && !out.contains(&name.to_string()) {
+            out.push(name.to_string());
+        }
+        if name.eq_ignore_ascii_case("UTF8_STRING")
+            || name.eq_ignore_ascii_case("STRING")
+            || name.eq_ignore_ascii_case("TEXT")
+            || name.to_ascii_lowercase().starts_with("text/plain")
+        {
+            for alias in ["UTF8_STRING", "STRING", "TEXT"] {
+                if !out.iter().any(|t| t == alias) {
+                    out.push(alias.to_string());
+                }
             }
         }
     }
@@ -309,7 +367,7 @@ impl SelectionBridge {
                         ctx,
                         source,
                         mime,
-                        &x11_target_for_mime(mime),
+                        &preferred_x11_target(mime),
                         bridge.clone(),
                     );
                 }
@@ -396,7 +454,7 @@ impl SelectionBridge {
                     ctx,
                     host_id,
                     mime,
-                    &x11_target_for_mime(mime),
+                    &preferred_x11_target(mime),
                     bridge.clone(),
                 );
             }
@@ -690,15 +748,15 @@ impl SelectionBridge {
         let Some(bridge) = self.bridge.clone() else {
             return;
         };
-        let wanted = x11_target_for_mime(&mime_for_x11_target(target));
+        let target_candidates = x11_target_candidates(target);
+        let matches = |m: &&String| {
+            target_candidates.iter().any(|t| t == *m)
+                || x11_target_aliases(m).iter().any(|a| a == target)
+        };
         if let Some(guest_offer) = self.active_host_offer {
             let offer = self.host_offers.get(&guest_offer).cloned();
             if let Some(offer) = offer {
-                let mime = offer
-                    .mimes
-                    .iter()
-                    .find(|m| x11_target_for_mime(m) == wanted || *m == target)
-                    .cloned();
+                let mime = offer.mimes.iter().find(matches).cloned();
                 if let Some(mime) = mime {
                     if self.prefetched.insert(format!("fetch:{target}")) {
                         prefetch_from_host_offer(ctx, offer.host_id, &mime, target, bridge.clone());
@@ -709,10 +767,7 @@ impl SelectionBridge {
         }
         if let Some(source) = self.active_source {
             let mimes = self.sources.get(&source).cloned().unwrap_or_default();
-            let mime = mimes
-                .iter()
-                .find(|m| x11_target_for_mime(m) == wanted || *m == target)
-                .cloned();
+            let mime = mimes.iter().find(matches).cloned();
             if let Some(mime) = mime {
                 if self.prefetched.insert(format!("fetch:{target}")) {
                     prefetch_from_guest_source(ctx, source, &mime, target, bridge.clone());
@@ -855,29 +910,42 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
-    fn mime_target_mapping_roundtrip() {
+    fn mime_target_mapping_is_mainline_identity() {
+        // sommelier.cc:2819-2841 / :2931-2967 — atom names and MIME strings
+        // are passed through verbatim in both directions.
         assert_eq!(
             x11_target_for_mime("text/plain;charset=utf-8"),
-            "UTF8_STRING"
-        );
-        assert_eq!(x11_target_for_mime("STRING"), "UTF8_STRING");
-        assert_eq!(x11_target_for_mime("image/png"), "image/png");
-        assert_eq!(
-            mime_for_x11_target("UTF8_STRING"),
             "text/plain;charset=utf-8"
         );
+        assert_eq!(x11_target_for_mime("UTF8_STRING"), "UTF8_STRING");
+        assert_eq!(x11_target_for_mime("image/png"), "image/png");
+        assert_eq!(mime_for_x11_target("UTF8_STRING"), "UTF8_STRING");
         assert_eq!(mime_for_x11_target("TARGETS"), "");
+        assert_eq!(mime_for_x11_target("_WL_SELECTION"), "");
         assert_eq!(mime_for_x11_target("image/png"), "image/png");
+        // Prefetching still prefers the widely served UTF8_STRING atom.
+        assert_eq!(
+            preferred_x11_target("text/plain;charset=utf-8"),
+            "UTF8_STRING"
+        );
+        assert_eq!(preferred_x11_target("image/png"), "image/png");
+        assert!(
+            x11_target_candidates("UTF8_STRING").contains(&"text/plain;charset=utf-8".to_string())
+        );
     }
 
     #[test]
-    fn normalize_targets_has_classic_atoms_and_no_duplicates() {
+    fn normalize_targets_starts_with_mainline_control_atoms() {
         let t = normalize_targets(&[
             "text/plain;charset=utf-8".into(),
             "text/plain;charset=utf-8".into(),
             "image/png".into(),
         ]);
-        assert_eq!(t[0], "UTF8_STRING");
+        // Mainline sl_set_selection inserts TARGETS and TIMESTAMP first.
+        assert_eq!(t[0], "TARGETS");
+        assert_eq!(t[1], "TIMESTAMP");
+        assert_eq!(t[2], "text/plain;charset=utf-8");
+        assert!(t.contains(&"UTF8_STRING".to_string()));
         assert!(t.contains(&"image/png".to_string()));
         assert_eq!(
             t.iter().filter(|x| *x == "image/png").count(),
@@ -931,12 +999,8 @@ mod tests {
 
         let offer_id = u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap());
         let (read, write) = nix::unistd::pipe().unwrap();
-        assert!(sel.receive_x11_offer(
-            &ctx,
-            offer_id,
-            "text/plain;charset=utf-8",
-            write.as_raw_fd(),
-        ));
+        // 1:1 MIME passthrough: the guest sees the X11 atom name verbatim.
+        assert!(sel.receive_x11_offer(&ctx, offer_id, "UTF8_STRING", write.as_raw_fd()));
         assert_eq!(sel.pending_receives.len(), 1);
         match bridge.try_recv_event() {
             Some(WmEvent::RequestClipboardData { target }) => {
@@ -958,12 +1022,7 @@ mod tests {
         sel.poll(&mut ctx);
         let offer_id = u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap());
         let (read, write) = nix::unistd::pipe().unwrap();
-        assert!(sel.receive_x11_offer(
-            &ctx,
-            offer_id,
-            "text/plain;charset=utf-8",
-            write.as_raw_fd(),
-        ));
+        assert!(sel.receive_x11_offer(&ctx, offer_id, "UTF8_STRING", write.as_raw_fd()));
         bridge.set_clipboard_data("UTF8_STRING".into(), b"hello".to_vec());
         sel.poll(&mut ctx);
         assert!(sel.pending_receives.is_empty());
@@ -1019,7 +1078,8 @@ mod tests {
         assert_eq!(sender, source);
         assert_eq!(op, wl_data_source::REQ_OFFER as u16);
         let mime_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        assert_eq!(&payload[4..4 + mime_len - 1], b"text/plain;charset=utf-8");
+        // Mainline sl_get_selection_targets offers the atom name verbatim.
+        assert_eq!(&payload[4..4 + mime_len - 1], b"UTF8_STRING");
 
         let (sender, op, payload) = decode(&q[3].0);
         assert_eq!(sender, device);
@@ -1077,12 +1137,13 @@ mod tests {
         drop(write);
         match bridge.try_recv_event() {
             Some(WmEvent::RequestClipboardData { target }) => {
-                assert_eq!(target, "UTF8_STRING")
+                // 1:1: the MIME the host asked for is the X11 target we request.
+                assert_eq!(target, "text/plain;charset=utf-8")
             }
             other => panic!("unexpected WmEvent: {:?}", other),
         }
 
-        bridge.set_clipboard_data("UTF8_STRING".into(), b"from-x11".to_vec());
+        bridge.set_clipboard_data("text/plain;charset=utf-8".into(), b"from-x11".to_vec());
         sel.poll(&mut ctx);
         let mut buf = Vec::new();
         let mut file = std::fs::File::from(read);
@@ -1118,6 +1179,7 @@ mod tests {
 
     #[test]
     fn control_atoms_never_become_exported_mimes() {
+        // Mainline exports atom names verbatim; only control atoms are dropped.
         assert_eq!(
             mimes_from_x11_targets(&[
                 "TARGETS".into(),
@@ -1125,7 +1187,7 @@ mod tests {
                 "UTF8_STRING".into(),
                 "STRING".into(),
             ]),
-            vec!["text/plain;charset=utf-8".to_string()]
+            vec!["UTF8_STRING".to_string(), "STRING".to_string()]
         );
     }
 

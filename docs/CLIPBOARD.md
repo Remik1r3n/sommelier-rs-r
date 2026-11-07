@@ -87,6 +87,29 @@ host / guest Wayland → X11（上一版已有，本版补 owner 争夺）
    `invalidate_clipboard_data()`；WM 侧 owner 清空时发布空 TARGETS，proxy 因此
    发出 `wl_data_device.set_selection(0, serial)`。
 
+### 3.3 MIME ↔ X11 target：与主线一致的 1:1 透传
+
+主线**没有**任何 MIME 映射表：`sl_get_selection_targets()` 把 X11 atom 名
+（`UTF8_STRING`、`image/png`…）原样作为 `wl_data_source.offer()` 的 MIME，
+`sl_send_data()` 再用 `xcb_get_atom_name()` 把 X11 请求的 target 原样作为
+`wl_data_offer.receive()` 的 MIME。X11 侧唯一"新增"的 target 是
+`sl_set_selection()` 在数组开头插入的 `TARGETS` 与 `TIMESTAMP`。
+
+本版早期自造了 `UTF8_STRING ↔ text/plain;charset=utf-8` 双向转换，这会让
+ChromeOS host 看到与主线不同的 MIME 名，属于不必要的区别。现在改为：
+
+- `mime_for_x11_target()` / `x11_target_for_mime()` 恒等，控制 atom
+  （`TARGETS`/`TIMESTAMP`/`MULTIPLE`/`SAVE_TARGETS`/`_WL_SELECTION`）过滤；
+- `normalize_targets()` 先发主线的 `TARGETS`, `TIMESTAMP`，再发 MIME 原名，
+  最后追加 `UTF8_STRING`/`STRING`/`TEXT` 作为**额外别名**（不改写 MIME）；
+- `preferred_x11_target()` 仅在向 X11 owner **预取**文本数据时优先用
+  `UTF8_STRING`（X11 owner 很少 intern 字面 MIME 名）；
+- `x11_target_candidates()` 让 `SelectionRequest` 无论请求 MIME 原名还是经典
+  atom，都能解析到同一个 Wayland offer。
+
+INCR 也按主线对齐：阈值与 chunk 都是 64 KiB（`sommelier.cc:2214`），
+INCR property 写的是 **chunk size** 而非总长度（`:2250-2257`）。
+
 ## 4. 已知取舍
 
 - **serial 可能为 0**：`Context::host_serial` 来自真实 host 输入事件。进程刚启动、

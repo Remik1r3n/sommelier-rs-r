@@ -70,7 +70,16 @@ fn spawn_runprog(cfg: &config::Config) -> Option<std::process::Child> {
     let (program, args) = cfg.runprog.split_first()?;
     let mut cmd = Command::new(program);
     cmd.args(args);
-    cmd.env("WAYLAND_DISPLAY", &cfg.socket_name);
+    if cfg.x11_enabled {
+        // Mainline sommelier.cc:3630-3635 — X11 programs must not accidentally
+        // fall back to a Wayland display, so a guaranteed-invalid name is used.
+        cmd.env("WAYLAND_DISPLAY", ".");
+    } else {
+        // Mainline sommelier.cc:4610-4613 — without X11 forwarding DISPLAY is
+        // unset so clients do not try to connect to a non-existent X server.
+        cmd.env_remove("DISPLAY");
+        cmd.env("WAYLAND_DISPLAY", &cfg.socket_name);
+    }
     if let Some(parent) = cfg.socket_path.parent() {
         cmd.env("XDG_RUNTIME_DIR", parent);
     }
@@ -102,6 +111,15 @@ async fn main() {
     let env = env_logger::Env::default().default_filter_or(log_filter(cfg.log_level));
     env_logger::Builder::from_env(env).init();
 
+    if let Err(e) = cfg.validate() {
+        eprintln!("sommelier-rs-r: {}", e);
+        std::process::exit(1);
+    }
+    // Mainline clears DISPLAY entirely when X11 forwarding is off.
+    if !cfg.x11_enabled {
+        std::env::remove_var("DISPLAY");
+    }
+
     // Diagnostic mode used by ChromeOS integration tests / quirk debugging.
     if let Some(steam_game_id) = args.print_enabled_features {
         println!("{}", cfg.quirks.print_features(steam_game_id));
@@ -119,12 +137,14 @@ async fn main() {
         cfg.quirks.enabled_features(0).len()
     );
     log::info!(
-        "feature flags: damage_buffer={} viewport_resize={} fullscreen_mode={} explicit_fence={} force_drm_device={:?}",
+        "feature flags: damage_buffer={} viewport_resize={} fullscreen_mode={} explicit_fence={} force_drm_device={:?} application_id={:?} application_id_property={:?}",
         cfg.damage_buffer,
         cfg.viewport_resize,
         cfg.fullscreen_mode,
         cfg.explicit_fence,
-        cfg.force_drm_device
+        cfg.force_drm_device,
+        cfg.application_id,
+        cfg.application_id_property
     );
 
     // ---- X11 / XWayland -------------------------------------------------

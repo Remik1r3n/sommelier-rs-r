@@ -27,9 +27,71 @@ pub struct RegistryHandler;
 /// `protocols::all::KNOWN_INTERFACES` is safe to forward; keeping a deny list
 /// (instead of an allow list) means adding a protocol XML automatically makes
 /// it available without touching this file.
-/// Highest `wl_compositor` version we can expose without supporting
-/// `wl_surface.damage_buffer` (introduced in v4).
-const MAX_COMPOSITOR_VERSION: u32 = 3;
+/// Mainline `sommelier-compositor.cc:1170`: advertise v4 (we implement
+/// `wl_surface.damage_buffer` by rewriting it to `wl_surface.damage`), or v3
+/// when `--no-support-damage-buffer` is in effect.
+const COMPOSITOR_VERSION: u32 = 4;
+const COMPOSITOR_VERSION_NO_DAMAGE_BUFFER: u32 = 3;
+/// Mainline always binds the host compositor at v3
+/// (`kMinHostWlCompositorVersion`, sommelier.h:80).
+const HOST_COMPOSITOR_VERSION: u32 = 3;
+/// Version clamps from `sl_registry_handler` (sommelier.cc:546-671).
+const MAX_OUTPUT_VERSION: u32 = 3;
+const MAX_SEAT_VERSION: u32 = 5;
+const MAX_DATA_DEVICE_MANAGER_VERSION: u32 = 3;
+const MAX_XDG_WM_BASE_VERSION: u32 = 3;
+const MAX_LINUX_DMABUF_VERSION: u32 = 4;
+const MAX_ZAURA_SHELL_VERSION: u32 = 38;
+const MIN_ZAURA_SHELL_VERSION: u32 = 6;
+const MAX_TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
+const MAX_WL_DRM_VERSION: u32 = 2;
+/// Synthetic registry names for globals that have no host counterpart
+/// (`zwp_text_input_manager_v3`, `gtk_shell1`). Host global names are small
+/// integers, so these cannot collide.
+pub const SYNTHETIC_TEXT_INPUT_V3_GLOBAL: u32 = 0x7fff_0000;
+pub const SYNTHETIC_GTK_SHELL1_GLOBAL: u32 = 0x7fff_0001;
+
+/// Version we advertise to the guest for a host global, mirroring the
+/// `MIN(...)` clamps in mainline's `sl_registry_handler`.
+fn advertised_version(interface: &str, host_version: u32, ctx: &Context) -> u32 {
+    match interface {
+        "wl_compositor" => {
+            if ctx.damage_buffer {
+                COMPOSITOR_VERSION
+            } else {
+                COMPOSITOR_VERSION_NO_DAMAGE_BUFFER
+            }
+        }
+        "wl_output" => host_version.min(MAX_OUTPUT_VERSION),
+        "wl_seat" => host_version.min(MAX_SEAT_VERSION),
+        "wl_data_device_manager" => host_version.min(MAX_DATA_DEVICE_MANAGER_VERSION),
+        "xdg_wm_base" => host_version.min(MAX_XDG_WM_BASE_VERSION),
+        "zwp_linux_dmabuf_v1" => host_version.min(MAX_LINUX_DMABUF_VERSION),
+        "zcr_text_input_extension_v1" => host_version.min(MAX_TEXT_INPUT_EXTENSION_VERSION),
+        "zwp_text_input_manager_v1" => 1,
+        "wl_drm" => host_version.min(MAX_WL_DRM_VERSION),
+        _ => host_version,
+    }
+}
+
+/// Version used when binding the corresponding object on the host.
+fn host_bind_version(interface: &str, requested: u32) -> u32 {
+    match interface {
+        // sommelier-compositor.cc:1187 — always v3, damage_buffer is handled
+        // locally and never forwarded to the host.
+        "wl_compositor" => HOST_COMPOSITOR_VERSION,
+        "wl_output" => requested.min(MAX_OUTPUT_VERSION),
+        "wl_seat" => requested.min(MAX_SEAT_VERSION),
+        "wl_data_device_manager" => requested.min(MAX_DATA_DEVICE_MANAGER_VERSION),
+        "xdg_wm_base" => requested.min(MAX_XDG_WM_BASE_VERSION),
+        "zwp_linux_dmabuf_v1" => requested.min(MAX_LINUX_DMABUF_VERSION),
+        "zcr_text_input_extension_v1" => requested.min(MAX_TEXT_INPUT_EXTENSION_VERSION),
+        "zwp_text_input_manager_v1" => 1,
+        "zaura_shell" => requested.min(MAX_ZAURA_SHELL_VERSION),
+        "wl_drm" => requested.min(MAX_WL_DRM_VERSION),
+        _ => requested,
+    }
+}
 
 const INTERNAL_GLOBALS: &[&str] = &[
     // ChromeOS aura-shell: bound internally for shelf app-ids.
@@ -58,8 +120,11 @@ const INTERNAL_GLOBALS: &[&str] = &[
     "zcr_gaming_seat_v2",
     "zcr_gamepad_v2",
     "zcr_gamepad_vibrator_v2",
+    // Mainline binds zxdg_output_manager_v1 internally (only with
+    // --direct-scale) and never advertises it to guests: the translated
+    // wl_output geometry already describes the virtual layout.
+    "zxdg_output_manager_v1",
     // Legacy / explicit-sync globals handled by the proxy itself.
-    "wl_drm",
     "gtk_shell1",
     "gtk_surface1",
     "zwp_linux_explicit_synchronization_v1",
@@ -83,13 +148,43 @@ fn is_advertisable(interface: &str, ctx: &Context) -> bool {
     if interface == "zwp_linux_dmabuf_v1" && !ctx.gpu_accel {
         return false;
     }
+    // Mainline sommelier.cc:589-628: in X11 mode the data device manager and
+    // xdg_wm_base are bound internally for the WM and are NOT advertised to
+    // the Xwayland client (which is the only client on that connection).
+    if ctx.is_xwayland_client && matches!(interface, "wl_data_device_manager" | "xdg_wm_base") {
+        return false;
+    }
     true
+}
+
+/// Re-emit a `wl_registry.global` event with a rewritten version. The generic
+/// forward path cannot change payload fields, so mainline-style version
+/// clamps need their own event.
+fn emit_global(ctx: &mut Context, name: u32, interface: &str, version: u32) {
+    let registry_guest_id = ctx
+        .shadow_table
+        .get_guest_id(ctx.last_sender_id)
+        .unwrap_or(ctx.last_sender_id);
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(name);
+    builder.write_string(interface);
+    builder.write_u32(version);
+    let msg = builder.build_message(registry_guest_id, wl_registry::EVT_GLOBAL as u16);
+    ctx.host_to_client_queue.push((msg, Vec::new()));
 }
 
 impl wl_registry::WlRegistryHandler for RegistryHandler {
     fn on_global(&mut self, ctx: &mut Context, name: u32, interface: &str, version: u32) -> Action {
         // Track host globals
         ctx.host_globals.insert(interface.to_string(), name);
+
+        // sommelier.cc:644-657 — wp_viewporter means fractional scaling is
+        // available, so drop the integer start-up scale in favour of the
+        // exact --scale value.
+        if interface == "wp_viewporter" {
+            let desired = ctx.desired_scale;
+            ctx.transform.set_scale(desired);
+        }
 
         // Xwayland never binds xdg_wm_base itself (rootless Xwayland only
         // creates wl_surfaces; the WM is expected to create the xdg roles).
@@ -116,8 +211,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // X11 CLIPBOARD -> host selection export. Mainline binds
         // wl_data_device_manager internally and uses its own wl_data_device
         // for set_selection; we do the same on the dedicated Xwayland
-        // connection. The guest still gets the normal global so it can bind
-        // its own manager/data device for Wayland-side copy & paste.
+        // connection. is_advertisable() below keeps this global off the
+        // Xwayland client's registry (sommelier.cc:589-628), so no guest
+        // bind is expected on this connection.
         if ctx.is_xwayland_client
             && interface == "wl_data_device_manager"
             && ctx.host_data_device_manager_id.is_none()
@@ -143,23 +239,18 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             );
         }
 
-        if interface == "wl_compositor" && !ctx.damage_buffer && version > MAX_COMPOSITOR_VERSION {
-            // `wl_surface.damage_buffer` was added in wl_compositor v4 and we
-            // cannot translate it for the host. Advertise (and later bind) v3
-            // so a conforming guest never emits the request at all.
-            let registry_guest_id = ctx
-                .shadow_table
-                .get_guest_id(ctx.last_sender_id)
-                .unwrap_or(ctx.last_sender_id);
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(name);
-            builder.write_string(interface);
-            builder.write_u32(MAX_COMPOSITOR_VERSION);
-            let msg = builder.build_message(registry_guest_id, wl_registry::EVT_GLOBAL as u16);
-            ctx.host_to_client_queue.push((msg, Vec::new()));
+        if interface == "wl_compositor" {
+            // Mainline advertises a fixed version (4 normally, 3 with
+            // --no-support-damage-buffer) regardless of the host version and
+            // binds the host at v3. `wl_surface.damage_buffer` is translated
+            // to `wl_surface.damage` by handler/compositor.rs.
+            let want = advertised_version(interface, version, ctx);
+            emit_global(ctx, name, interface, want);
             log::debug!(
-                "Capping wl_compositor global at v{} (--no-support-damage-buffer)",
-                MAX_COMPOSITOR_VERSION
+                "Advertising wl_compositor v{} (host v{}, damage_buffer={})",
+                want,
+                version,
+                ctx.damage_buffer
             );
             return Action::Drop;
         }
@@ -175,21 +266,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.shadow_table
                 .track_host_interface(host_id, "zwp_linux_dmabuf_v1".to_string());
 
-            let client_version = version;
-            let mut global_builder = MessageBuilder::new();
-            global_builder.write_u32(name);
-            global_builder.write_string(interface);
-            global_builder.write_u32(client_version);
-
-            // Translate host registry ID to guest registry ID
-            let registry_guest_id = ctx
-                .shadow_table
-                .get_guest_id(ctx.last_sender_id)
-                .unwrap_or(ctx.last_sender_id);
-
-            let global_msg =
-                global_builder.build_message(registry_guest_id, wl_registry::EVT_GLOBAL as u16);
-            ctx.host_to_client_queue.push((global_msg, Vec::new()));
+            let client_version = advertised_version(interface, version, ctx);
+            emit_global(ctx, name, interface, client_version);
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
@@ -210,28 +288,23 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // The host does not send events to the text_input_manager factory; no
             // shadow table entry needed.
 
-            let client_version = 1;
-            let mut global_builder = MessageBuilder::new();
-            global_builder.write_u32(name);
-            global_builder.write_string("zwp_text_input_manager_v3");
-            global_builder.write_u32(client_version);
+            // Mainline advertises zwp_text_input_manager_v1 v1. We additionally
+            // advertise v3 (translated to the host's v1 manager) so modern
+            // toolkits keep working; both are part of the compatibility goal.
+            emit_global(ctx, name, "zwp_text_input_manager_v1", 1);
+            emit_global(
+                ctx,
+                SYNTHETIC_TEXT_INPUT_V3_GLOBAL,
+                "zwp_text_input_manager_v3",
+                1,
+            );
 
-            // Translate host registry ID to guest registry ID
-            let registry_guest_id = ctx
-                .shadow_table
-                .get_guest_id(ctx.last_sender_id)
-                .unwrap_or(ctx.last_sender_id);
-
-            let global_msg =
-                global_builder.build_message(registry_guest_id, wl_registry::EVT_GLOBAL as u16);
-            ctx.host_to_client_queue.push((global_msg, Vec::new()));
-
-            // 2. Bind internally
+            // 2. Bind internally at mainline's kTextInputManagerVersion = 1.
             let registry_host_id = ctx.last_sender_id;
             let mut builder = MessageBuilder::new();
             builder.write_u32(name);
             builder.write_string(interface);
-            builder.write_u32(version);
+            builder.write_u32(1);
             builder.write_u32(host_id); // new_id
 
             let full_msg = builder.build_message(registry_host_id, wl_registry::REQ_BIND as u16);
@@ -243,13 +316,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.host_text_input_extension_v1_id = Some(host_id);
             // The host does not send events to the text_input_extension factory; no
             // shadow table entry needed.
+            let client_version = advertised_version(interface, version, ctx);
 
-            // 2. Bind internally
+            // Mainline advertises this global at min(host, 11) and binds it
+            // both internally and on behalf of the guest.
+            emit_global(ctx, name, interface, client_version);
+
             let registry_host_id = ctx.last_sender_id;
             let mut builder = MessageBuilder::new();
             builder.write_u32(name);
             builder.write_string(interface);
-            builder.write_u32(version);
+            builder.write_u32(client_version);
             builder.write_u32(host_id); // new_id
 
             let full_msg = builder.build_message(registry_host_id, wl_registry::REQ_BIND as u16);
@@ -303,6 +380,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.client_to_host_queue.push((full_msg, Vec::new()));
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
+            // Mainline sommelier.cc:629-643 exposes `gtk_shell1` v1 (not
+            // zaura_shell) to guests whenever the host aura shell is >= v6.
+            // handler/gtk_shell.rs translates its requests onto zaura_shell.
+            if version >= MIN_ZAURA_SHELL_VERSION {
+                emit_global(ctx, SYNTHETIC_GTK_SHELL1_GLOBAL, "gtk_shell1", 1);
+            }
+
             return Action::Drop;
         } else if interface == "wl_shm" {
             let host_id = ctx.shadow_table.allocate_host_id();
@@ -327,6 +411,14 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             log::debug!("Filtering host global {} v{}", interface, version);
             return Action::Drop;
         }
+        // Apply mainline's version clamps to everything else. Rewriting the
+        // event (rather than forwarding it) is what makes wl_output v3 /
+        // wl_seat v5 / xdg_wm_base v3 deterministic regardless of host.
+        let want = advertised_version(interface, version, ctx);
+        if want != version {
+            emit_global(ctx, name, interface, want);
+            return Action::Drop;
+        }
         Action::Forward
     }
 
@@ -334,14 +426,23 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // id is (interface, version, new_id)
         let (interface, _version, guest_new_id) = id;
 
-        // Keep the host binding in sync with the version we advertised: a
-        // guest that (incorrectly) requests v4+ must not make the host believe
-        // damage_buffer is supported.
-        let bound_version = if interface == "wl_compositor" && !ctx.damage_buffer {
-            (*_version).min(MAX_COMPOSITOR_VERSION)
-        } else {
-            *_version
-        };
+        // Mainline clamps both the guest-advertised and host-bound versions
+        // (`sl_registry_handler`, `sl_bind_host_*`). In particular the host
+        // wl_compositor is always bound at v3 while guests see v4.
+        let bound_version = host_bind_version(interface, *_version);
+
+        // `gtk_shell1` has no host counterpart: it is implemented locally on
+        // top of the internally-bound zaura_shell (sommelier-gtk-shell.cc).
+        if interface == "gtk_shell1" {
+            if let Some(host_id) = ctx.host_zaura_shell_id {
+                ctx.shadow_table.map_id(*guest_new_id, host_id);
+                ctx.shadow_table
+                    .track_interface(*guest_new_id, "gtk_shell1".to_string());
+            } else {
+                error!("gtk_shell1 bound but host zaura_shell is missing");
+            }
+            return Action::Drop;
+        }
 
         if interface == "wl_shm" {
             // Do NOT forward wl_shm to host. We emulate it.

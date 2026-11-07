@@ -275,6 +275,15 @@ impl Transform {
         self.outputs = outputs;
     }
 
+    /// Mainline `sommelier.cc:644-657`: once the host advertises
+    /// `wp_viewporter`, the integer-only start-up scale is replaced by the
+    /// exact `desired_scale` value (still clamped to [0.1, 10]).
+    pub fn set_scale(&mut self, scale: f64) {
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale.clamp(MIN_SCALE, MAX_SCALE);
+        }
+    }
+
     fn is_stable(&self) -> bool {
         self.stable_scale || self.mode == ScalingMode::Stable
     }
@@ -319,6 +328,22 @@ impl Transform {
         }
         let s = sat_i32((host_scale / self.scale).ceil());
         s.clamp(1, MAX_OUTPUT_SCALE)
+    }
+
+    /// 主线 `sl_output_update_output_x` (sommelier-output.cc:283-295)：输出在
+    /// 虚拟空间里从左到右横向排布，`wl_output.geometry` 的 x 是前面所有输出
+    /// （旋转后）虚拟宽度之和，y 恒为 0。
+    pub fn virtual_x_for_host_x(&self, host_x: i32) -> i32 {
+        let mut virt_x: i64 = 0;
+        for o in &self.outputs {
+            if o.x >= host_x {
+                break;
+            }
+            let (vw, vh) = self.host_to_guest_size(o.physical_width, o.physical_height);
+            let (rw, _) = apply_rotation(o.transform, vw, vh);
+            virt_x += rw.max(0) as i64;
+        }
+        virt_x.clamp(i32::MIN as i64, i32::MAX as i64) as i32
     }
 
     /// guest 侧虚拟输出尺寸：所有输出横向排布，总宽为各输出（旋转后）

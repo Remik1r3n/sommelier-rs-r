@@ -41,11 +41,12 @@ use x11rb::protocol::xproto::{
 use crate::x11::atoms::{Atom as X11Atom, AtomTable};
 use crate::x11::bridge::X11Bridge;
 
-/// Payloads larger than this are sent with the INCR protocol instead of one
-/// big `ChangeProperty` (which is bounded by the server's max request size).
-const INCR_THRESHOLD: usize = 128 * 1024;
-/// Size of each INCR chunk.
-const INCR_CHUNK: usize = 32 * 1024;
+/// Mainline `sl_incr_chunk_size = 64 * 1024` (sommelier.cc:2214): it buffers
+/// that much before deciding between a one-shot transfer and INCR, and uses
+/// the same value as the INCR chunk size.
+const INCR_THRESHOLD: usize = 64 * 1024;
+/// Size of each INCR chunk (identical to the threshold in mainline).
+const INCR_CHUNK: usize = 64 * 1024;
 /// How many 4-byte units to fetch per property read.
 const PROPERTY_LONG_LENGTH: u32 = 4096;
 /// How long a SelectionRequest may wait for the Wayland side to fetch data
@@ -202,17 +203,11 @@ impl ClipboardBridge {
         let mut ok = false;
 
         if target == a(X11Atom::Targets) {
-            // Classical ICCCM atoms plus whatever the Wayland side advertised
-            // (WmEvent::ClipboardTargets -> note_targets). Interning the names
-            // here keeps TARGETS honest for non-text MIME types too.
-            let mut list = vec![
-                a(X11Atom::Targets),
-                a(X11Atom::Timestamp),
-                a(X11Atom::Utf8String),
-                a(X11Atom::StringType),
-                a(X11Atom::Text),
-                a(X11Atom::WlSelection),
-            ];
+            // Mainline `sl_set_selection` (sommelier.cc:354-371) inserts only
+            // TARGETS and TIMESTAMP in front of the offered MIME names. The
+            // classic text atoms arrive via `normalize_targets`; the internal
+            // _WL_SELECTION property must never be advertised as a target.
+            let mut list = vec![a(X11Atom::Targets), a(X11Atom::Timestamp)];
             for name in &self.targets {
                 if name.is_empty() {
                     continue;
@@ -556,7 +551,7 @@ impl ClipboardBridge {
             return false;
         };
         let a = |x: X11Atom| atoms.get(x);
-        if data.len() <= INCR_THRESHOLD {
+        if data.len() < INCR_THRESHOLD {
             return change_prop(
                 conn,
                 requestor,
@@ -568,9 +563,10 @@ impl ClipboardBridge {
             );
         }
 
-        // INCR: advertise the total length, then stream chunks as the
-        // requestor deletes the property (see handle_property_notify).
-        let len_bytes = (data.len() as u32).to_le_bytes();
+        // INCR: mainline writes `sl_incr_chunk_size` (not the total payload
+        // length) into the INCR property, then streams chunks as the
+        // requestor deletes the property (sommelier.cc:2250-2257).
+        let chunk_bytes = (INCR_CHUNK as u32).to_le_bytes();
         if !change_prop(
             conn,
             requestor,
@@ -578,7 +574,7 @@ impl ClipboardBridge {
             a(X11Atom::Incr),
             32,
             1,
-            &len_bytes,
+            &chunk_bytes,
         ) {
             return false;
         }

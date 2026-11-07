@@ -173,8 +173,12 @@ impl WlOutputHandler for OutputHandler {
             return Action::Forward;
         };
 
-        // Host Logical -> Virtual position.
-        let (gx, gy) = ctx.transform.host_to_guest(x, y);
+        // Mainline `sl_output_send_host_output_state` (sommelier-output.cc:401)
+        // sends geometry(virt_x, 0, ...) — outputs are laid out horizontally
+        // in virtual space, so y is always 0 and x is the accumulated virtual
+        // width of every output to the left.
+        let gx = ctx.transform.virtual_x_for_host_x(x);
+        let gy = 0;
         // Physical millimetres are derived from the pixel size and the DPI
         // bucket, not from the host's own (host-DPI-specific) value.
         let (pw, ph) = self
@@ -230,7 +234,14 @@ impl WlOutputHandler for OutputHandler {
         let Some(gid) = guest_id(ctx) else {
             return Action::Forward;
         };
-        let guest_scale = ctx.transform.guest_output_scale(factor.max(1) as f64);
+        // Mainline `sl_output_get_host_output_state` X11 branch
+        // (sommelier-output.cc:106-108) forces the advertised integer scale
+        // to 1: Xwayland works in the virtual coordinate space already.
+        let guest_scale = if ctx.is_xwayland_client {
+            1
+        } else {
+            ctx.transform.guest_output_scale(factor.max(1) as f64)
+        };
         let mut b = MessageBuilder::new();
         b.write_i32(guest_scale);
         emit(ctx, gid, EVT_SCALE, b);

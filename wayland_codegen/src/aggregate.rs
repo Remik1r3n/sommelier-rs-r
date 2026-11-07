@@ -70,6 +70,9 @@ const EXPLICIT_DELEGATES: &[&str] = &[
     "xdg_output_unstable_v1",
     "keyboard_extension_unstable_v1",
     "aura_shell",
+    // gtk_shell1/gtk_surface1 are guest-only objects translated onto
+    // zaura_shell by handler/gtk_shell.rs.
+    "gtk",
 ];
 
 fn interfaces(p: &Protocol) -> Vec<&Interface> {

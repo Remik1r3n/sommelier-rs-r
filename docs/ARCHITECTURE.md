@@ -212,8 +212,10 @@ sequenceDiagram
 ## 9. 配置
 
 `config.rs` 用 clap 统一主线 C++ `sommelier` 与两个上游分支的 CLI，并支持
-`SOMMELIER_*` 环境变量（命令行优先）。`display` 同时接受位置参数与
-`--display`。`main.rs` 负责 X11 条件启动（失败降级为 Wayland-only）、
+`SOMMELIER_*` 环境变量（命令行优先）。与主线一致：`--socket` 是 guest 监听
+socket 名（默认 `wayland-0`），`--display` / `SOMMELIER_DISPLAY` 是要连接的
+host Wayland display，第一个位置参数起为 `[program] [args...]`。
+`main.rs` 负责 X11 条件启动（失败降级为 Wayland-only）、
 `runprog` 子进程与 `exit_with_child`、`sd_notify READY=1`、
 `--print-enabled-features`。
 

@@ -67,7 +67,13 @@ pub struct X11Options {
     /// Pass `-shm` to Xwayland (software rendering fallback).
     pub shm: bool,
     pub scale: f64,
+    /// `org.chromium.guest_os.<vm>.` — mainline APPLICATION_ID_FORMAT_PREFIX.
+    /// The WM appends `wmclass.`/`xid.`/`wmclientleader.`/`xprop.` + value.
     pub app_id_prefix: String,
+    /// `--application-id`: overrides every derived X11 app id.
+    pub application_id: Option<String>,
+    /// `--application-id-x11-property`: CARDINAL property read for app ids.
+    pub application_id_property: Option<String>,
     // X11 frame colour (X11 0xRRGGBB) and RandR emulation, both applied by
     // the WM thread; see `wm.rs::border_color` / `update_randr_emu`.
     pub frame_color: String,
@@ -84,11 +90,14 @@ impl Default for X11Options {
             x_auth: None,
             x_font_path: None,
             gl_driver_path: None,
-            enable_xshape: true,
+            // Mainline defaults (sommelier-ctx.cc:210): XShape is opt-in.
+            enable_xshape: false,
             clipboard_manager: true,
             shm: true,
             scale: 1.0,
             app_id_prefix: String::new(),
+            application_id: None,
+            application_id_property: None,
             frame_color: String::new(),
             dark_frame_color: String::new(),
             allow_randr_emu: false,
@@ -352,7 +361,7 @@ mod tests {
         assert!(o.xwayland_cmd_prefix.is_empty());
         assert_eq!(o.x_display, None);
         assert!(o.clipboard_manager);
-        assert!(o.enable_xshape);
+        assert!(!o.enable_xshape);
         assert!(o.shm);
         assert_eq!(o.scale, 1.0);
         assert_eq!((XCURSOR_SIZE_BASE * o.scale).round() as i32, 24);

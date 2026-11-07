@@ -66,12 +66,20 @@ cargo build --release --target x86_64-unknown-linux-gnu
 install -m 755 target/x86_64-unknown-linux-gnu/release/sommelier-rs-r \
         ~/.local/bin/sommelier-rs-r
 
-# 3. 只跑 Wayland（与 virtwl 分支用法一致）
-~/.local/bin/sommelier-rs-r --transport=auto --virtio-wl /dev/wl0 wayland-0
+# 3. 只跑 Wayland（--socket 是 guest 监听的 display 名）
+~/.local/bin/sommelier-rs-r --transport=auto --virtio-wl /dev/wl0 --socket=wayland-0
 
 # 4. 同时启用 X11 转发
-~/.local/bin/sommelier-rs-r --transport=auto -X --display=wayland-0
+~/.local/bin/sommelier-rs-r --transport=auto -X --socket=wayland-0
+
+# 5. 主线写法：--display 指定要连接的「宿主」compositor（不是监听 socket）
+~/.local/bin/sommelier-rs-r --display=wayland-0 --socket=wayland-1 -X
 ```
+
+> **与主线一致的参数语义**：`--socket` = 监听 socket 名（默认 `wayland-0`），
+> `--display` / `SOMMELIER_DISPLAY` = 要连接的 **host** Wayland display，
+> 位置参数 = `[program] [args...]`（主线在第一个位置参数处停止解析选项）。
+> 详细说明见 `docs/MAINLINE_PARITY.md`。
 
 启用 `-X` 后进程会自动设置 `DISPLAY` / `XCURSOR_SIZE`，X11 应用直接可用。
 Xwayland 默认路径为 `/opt/google/cros-containers/bin/Xwayland`，可用
@@ -85,6 +93,8 @@ systemd 用户单元见 `packaging/systemd/sommelier-rs@.service`，
 
 | 参数 | 说明 |
 |---|---|
+| `--socket` | guest 监听 socket 名（主线 `--socket`，默认 `wayland-0`） |
+| `--display` / `SOMMELIER_DISPLAY` | 要连接的 host Wayland display（主线语义） |
 | `--transport`, `--virtio-wl`, `--local-compositor`, `--virtgpu-channel` | host 传输选择 |
 | `--force-drm-device=PATH` | 强制 GBM / virtgpu 使用的 render node |
 | `-X`, `--x-display`, `--xwayland-path`, `--x-auth`, `--glamor` | X11 / Xwayland |
@@ -93,7 +103,7 @@ systemd 用户单元见 `packaging/systemd/sommelier-rs@.service`，
 | `--quirks-config`, `--print-enabled-features` | quirks 规则 |
 | `--disable-xdg-decoration`, `--no-support-damage-buffer`, `--gpu-accel` | 协议开关 |
 | `--parent`, `--no-exit-with-child`, `--sd-notify`, `--log-level` | 进程行为 |
-| 末尾 `-- <program> [args...]` | 就绪后启动子进程 |
+| `[program] [args...]`（可用 `--` 分隔） | 就绪后启动子进程，与主线一致 |
 
 完整参数表：`sommelier-rs-r --help`。主线约定的 `SOMMELIER_*` 环境变量
 （如 `SOMMELIER_SCALE`、`SOMMELIER_ACCELERATORS`、`SOMMELIER_X11`）同样生效。
@@ -158,6 +168,7 @@ docs/                  当前架构、剪贴板主线对照、分支合并记录
 | `v0.3.0-r-merge-baseline` | 两分支完整对比合并、X11 转发主体、统一 CLI，编译干净 |
 | `v0.3.0-r` | X11 ↔ guest Wayland 剪贴板、缩放/输出与内部协议正确性修复、RandR 模拟、边框、viewport、CI 真实测试 |
 | `v0.3.1-r` | 按主线补齐 X11 → ChromeOS host 剪贴板导出、host/Wayland 复制夺回 X11 owner、serial 跟踪、内部对象事件隔离 |
+| `v0.3.2-r` | 逐项对照主线消除语义偏差：`--socket`/`--display`/位置参数、global 版本钳制、`gtk_shell1` 桥接、剪贴板 MIME 1:1、X11 app_id、INCR 64 KiB、输出几何、env 与 C 风格数值解析。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) |
 
 ## 其他说明
 

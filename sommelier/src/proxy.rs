@@ -57,6 +57,8 @@ struct SommelierHandler {
     seat: crate::handler::seat::SeatHandler,
     output: crate::handler::output::OutputHandler,
     viewport: crate::handler::viewport::ViewportHandler,
+    gtk_shell1: crate::handler::gtk_shell::GtkShellHandler,
+    gtk_surface1: crate::handler::gtk_shell::GtkSurfaceHandler,
 }
 
 impl SommelierHandler {
@@ -79,6 +81,8 @@ impl SommelierHandler {
             seat: crate::handler::seat::SeatHandler,
             output: crate::handler::output::OutputHandler::new(),
             viewport: crate::handler::viewport::ViewportHandler,
+            gtk_shell1: crate::handler::gtk_shell::GtkShellHandler::new(),
+            gtk_surface1: crate::handler::gtk_shell::GtkSurfaceHandler,
         }
     }
 }
@@ -122,6 +126,7 @@ impl Client {
         ctx.vm_identifier = cfg.vm_identifier.clone();
         ctx.damage_buffer = cfg.damage_buffer;
         ctx.viewport_resize = cfg.viewport_resize;
+        ctx.desired_scale = cfg.desired_scale;
         // `--force-drm-device` also selects the GBM node used by the local
         // SHM/memfd fallback allocator.
         if let Some(path) = &cfg.force_drm_device {
@@ -947,6 +952,14 @@ impl protocols::keyboard_extension_unstable_v1::ProtocolHandler for SommelierHan
 // zaura_shell is bound internally; its events must never reach the guest.
 protocols::aura_shell::impl_sommelier_delegates!(SommelierHandler, {});
 impl protocols::aura_shell::ProtocolHandler for SommelierHandler {}
+
+// gtk_shell1 is implemented locally (mainline sommelier-gtk-shell.cc) and is
+// deliberately excluded from the generated "pure forward" delegates.
+protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
+    gtk_shell1: gtk_shell1,
+    gtk_surface1: gtk_surface1
+});
+impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 
 protocols::all::impl_generated_delegates!(SommelierHandler);
 

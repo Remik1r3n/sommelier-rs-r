@@ -56,21 +56,22 @@
 | `--dpi` 桶与 physical mm 换算 | ✅ | `transform.rs::physical_size_for_dpi` |
 | `wl_fixed` 24.8 定点变换（无 f32 精度损失） | ✅ | `transform.rs::fixed_mul_frac` |
 | `wl_output.geometry/mode/scale/name/description/done` 改写 | ✅ | `handler/output.rs`（本次接入运行时） |
-| `zxdg_output_v1.logical_position/logical_size` 改写 | ✅ | `handler/output.rs` |
+| `zxdg_output_v1.logical_position/logical_size` 改写 | ✅ | `handler/output.rs`；按主线 `sommelier.cc:759-775`，`zxdg_output_manager_v1` **不向 guest 公布**（仅 `--direct-scale` 时内部 bind），handler 保留用于 host 内部状态 |
 | `wp_fractional_scale_v1.preferred_scale` 改写 | ✅ | `handler/output.rs` |
 | 多输出布局、按位置推断输出、虚拟桌面尺寸 | ✅ | `transform.rs::set_outputs` / `virtual_dimensions` |
 | per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通 |
-| `wl_surface.damage_buffer` 支持开关 | ✅ | `--no-support-damage-buffer` 把 `wl_compositor` 的 global 与 bind 都 clamp 到 v3；违规 v4 `damage_buffer` 请求被 `handler/compositor.rs` 改写为按坐标系变换的 v1 `damage` |
+| `wl_surface.damage_buffer` 支持开关 | ✅ | 与主线 `sommelier-compositor.cc:1170` 一致：guest global 固定 **v4**（`--no-support-damage-buffer` / `SOMMELIER_SUPPORT_DAMAGE_BUFFER≠1` 时 v3），host bind 恒 v3；v4 `damage_buffer` 请求由 `handler/compositor.rs` 改写为按坐标系变换的 `damage` |
 | `preferred_scale` 严格等价于主线 `round(wire_scale / scale)` | ✅ | 保留 1/120 精度，不再量化到 120 的整数倍；含分数 scale 单测 |
 
 ## 4. ChromeOS 专有能力（保留自 `virtwl`）
 
 | 能力 | 状态 |
 |---|---|
-| `zaura_shell` / `zaura_surface` shelf app-id | ✅ 内部绑定，不向 guest 暴露 |
+| `zaura_shell` / `zaura_surface` shelf app-id | ✅ 内部绑定（≤v38），不向 guest 暴露 |
+| `gtk_shell1` → `zaura_shell` 协议桥接 | ✅ `handler/gtk_shell.rs`，对应主线 `sommelier-gtk-shell.cc`；host aura shell ≥ v6 时向 guest 公布 `gtk_shell1` v1 |
 | `zcr_keyboard_extension_v1` / `zcr_extended_keyboard_v1` 系统快捷键 ack-key | ✅ |
 | `SOMMELIER_ACCELERATORS` / `SOMMELIER_WINDOWED_ACCELERATORS` 过滤 | ✅ `accelerator.rs` |
-| `zwp_text_input_v1` + `zcr_text_input_extension_v1` ↔ guest `zwp_text_input_v3` | ✅ `handler/text_input.rs` |
+| `zwp_text_input_v1` + `zcr_text_input_extension_v1` ↔ guest `zwp_text_input_v3` | ✅ 同时公布主线 v1（透明转发到 host，固定 v1）与 v3（映射到内部 host v1 manager）；extension 按主线 `MIN(host,11)` 公布。`handler/text_input.rs` |
 | `zcr_text_input_crostini_v1` / `zcr_text_input_x11_v1` | ⚠️ 协议 XML 与生成代码就绪，无手写 handler |
 | gaming input / stylus / tablet 扩展 | ✅ 纯转发 |
 | `zwp_linux_dmabuf_v1` + GBM / explicit fence | ⚠️ 协议与 GBM 分配可用，`--explicit-fence` 未接入 fence 逻辑 |
@@ -85,7 +86,7 @@
 | `wl_data_device.data_offer` 手写重映射 | ✅ | `handler/data_device.rs`，与通用路径互补 |
 | `wl_data_offer.receive` 跨 VM 管道 + tokio pump | ✅ | `VIRTWL_IOCTL_NEW_PIPE_READ` |
 | SHM 四级降级分配 | ✅ | `handler/shm.rs` + `allocator.rs`（sealed memfd 防 SIGBUS） |
-| registry global 过滤（deny-list + 内部协议） | ✅ | `handler/registry.rs` + `protocols::all::is_known()` |
+| registry global 过滤（deny-list + 内部协议） | ✅ | `handler/registry.rs` + `protocols::all::is_known()`；X11 连接按主线不公布 `wl_data_device_manager` / `xdg_wm_base` |
 | 未知 opcode 只丢单条消息、不杀连接 | ✅ | `proxy.rs::handle_msgs` |
 | EOF 判定 `bytes == 0 && read_fds.is_empty()` | ✅ | 从 `main` 回补 |
 | 方向分离的 sender id | ✅ | `last_guest_sender_id` / `last_host_sender_id` |
@@ -93,9 +94,10 @@
 | 聚合 `dispatch_request` / `dispatch_event` / `impl_generated_delegates!` | ✅ | `wayland_codegen/src/aggregate.rs` |
 | `&str` handler 参数（非 `&String`） | ✅ | 从 `main` 取回并统一全部手写 handler |
 | 内部绑定协议的 host event 隔离 | ✅ | `aggregate.rs::INTERNAL_ONLY` 覆盖 10 个纯内部模块；text-input v1 / extension 因需要转 v3 事件而有意保留转发 |
-| `wl_compositor` 版本钳制 + `damage_buffer` → `damage` 改写 | ✅ | `handler/registry.rs` + `handler/compositor.rs`，含 2 个单测 |
+| 主线式 global 版本钳制 | ✅ | `advertised_version()` / `host_bind_version()`：compositor 4/3、output ≤3、seat ≤5、data_device_manager ≤3、xdg_wm_base ≤3、dmabuf ≤4、text-input-extension ≤11、wl_drm ≤2 |
+| `damage_buffer` → `damage` 改写 | ✅ | `handler/compositor.rs`，含 2 个单测 |
 | quirks textproto-like 规则（steam_game_id / always / enable / disable / merge） | ✅ | `quirks.rs`；不引入 protobuf，多 condition 整条跳过 |
-| 主线 CLI + `SOMMELIER_*` 环境变量 | ✅ | `config.rs`，7 个配置单测 |
+| 主线 CLI + `SOMMELIER_*` 环境变量 | ✅ | `config.rs`，12 个配置单测；`--socket`/`--display`/位置参数语义与主线一致。逐项对照见 [`docs/MAINLINE_PARITY.md`](MAINLINE_PARITY.md) |
 
 ### 协议清单（33 个 XML）
 
@@ -156,11 +158,11 @@
 | `cargo check --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | build script 生成 | ✅ 33 个协议模块 + 1 个聚合模块（34 个 include） |
-| 单元测试 | 135 个 `#[test]` 全部编译通过（含 X11 子系统 44 个、keyboard 19、transform 17、quirks 14、config 8、output 2、viewport 3、selection 13、proxy 3 等） |
-| CLI 参数解析 | ✅ 用独立 clap 形状验证实测：位置 display、`--display`、`-- <program>`、常见 flag 组合均正确解析，无歧义/panic |
+| 单元测试 | 142 个 `#[test]` 全部编译通过（本轮新增：CLI 语义 3、gtk_shell1 桥接 3、剪贴板 MIME 与 TARGETS 顺序 2 等） |
+| CLI 参数解析 | ✅ 用独立 clap crate 在 Windows 本机**实跑** 6 组形状验证全部通过：`--socket` vs `--display`、位置参数 runprog、`--` 分隔、`--sd-notify` 不吃位置参数、全量主线 flag 拼写、`--help`/`--version` |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
-| Rust 源码规模 | 18,267 行（`sommelier/src` + `wayland_codegen/src`） |
+| Rust 源码规模 | 19,204 行（`sommelier/src` + `wayland_codegen/src`） |
 | 真实设备运行 | ❌ 未执行，见 §6.1 |
 
 ### 合并过程中修掉的既有缺陷
@@ -170,7 +172,7 @@
 3. `last_sender_id` 方向混用 → 增加方向专用字段，旧字段保持兼容；
 4. `--virtgpu-channel` 是死参数 → 真正接入 `connect_host()`；
 5. `VirtGpuChannel::new()` / `Allocator::new()` 不支持指定设备 → `new_with_device` / `with_device`；
-6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.1-r`）；
+6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.2-r`）；
 7. `virtwl` 的 `&String` handler 参数 → 回退为 `&str`；
 8. `WaylandConnection::new` 未设 `O_NONBLOCK`（virtwl 修复，已保留）；
 9. EOF 误断连（main 修复，已回补）。
