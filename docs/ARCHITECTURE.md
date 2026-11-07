@@ -122,10 +122,22 @@ third_party/protocols/*.xml (33)
 `dispatch_request()` / `dispatch_event()` 与 `impl_generated_delegates!`。
 新增协议只需放入一个 XML，不必再改 `proxy.rs` / `registry.rs`。
 
-12 个协议有手写 delegation（见 `proxy.rs`），其余由聚合宏生成纯转发；
-10 个纯内部绑定模块在 `INTERNAL_ONLY` 中，其 host event 直接丢弃。
+16 个协议有手写 delegation（见 `proxy.rs` 的
+`impl_sommelier_delegates!` / `ProtocolHandler` 挂载），其余由聚合宏生成纯转发；
+`aggregate.rs::EXPLICIT_DELEGATES` 列出这 16 个模块以避免生成冲突实现。
+10 个纯内部绑定模块在 `INTERNAL_ONLY` 中，其 host event 在聚合分发层直接丢弃。
+唯一的例外是 `INTERNAL_EVENT_EXCEPTIONS = ["zaura_output"]`：它的
+`scale` / `connection` / `device_scale_factor` 必须交给 `OutputHandler` 本地消费，
+否则输出 DPI 与缩放修正无法生效。
 `text_input_unstable_v1` / `text_input_extension_unstable_v1` **刻意不屏蔽**：
 它们的 host event 由 `handler/text_input.rs` 转成 guest 的 text-input-v3 事件。
+
+可观测性由 `stats.rs` 独立承担：全进程共享一个 `Stats`，`proxy::run()` 起单个
+定时采样任务，`Client::run()` 结束时写入最终样本。`--timing-filename` /
+`--stats-log` 输出 CSV、`--stats-summary` 输出实时快照、
+`--trace-filename` 逐消息记录方向/接口/opcode/长度。连接建立时
+`proxy::so_peercred_pid()` 用 `SO_PEERCRED` 取 client pid（显式 `--peer-pid`
+优先），注入 `Context.client_pid`。
 
 ## 6. X11 子系统
 

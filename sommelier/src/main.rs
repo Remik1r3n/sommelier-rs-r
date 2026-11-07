@@ -27,6 +27,7 @@ mod handler;
 mod proxy;
 mod quirks;
 mod state;
+mod stats;
 mod transform;
 mod virtgpu_channel;
 mod virtwl;

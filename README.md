@@ -64,7 +64,7 @@ ChromeOS 专有扩展等）。
 [`docs/CROSTINI_INSTALL.md`](docs/CROSTINI_INSTALL.md)）：
 
 ```bash
-sudo dpkg -i sommelier-rs-r_0.3.6-r_amd64.deb
+sudo dpkg -i sommelier-rs-r_0.3.7-r_amd64.deb
 sommelier-rs-r --transport=virtwl --virtio-wl /dev/wl0 --socket=wayland-wb
 WAYLAND_DISPLAY=wayland-wb your-app          # 另一个终端
 ```
@@ -173,16 +173,17 @@ docs/                  当前架构、安装指南、功能矩阵、剪贴板对
 详见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md) §6。最需要注意的四点：
 
 1. **ChromeOS host 侧的人工交互尚未验证**：Wayland 与 X11 两条主链路已在
-   Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通（`-X` 启动、真实 X11
-   窗口、剪贴板往返均实测），但「X11 复制 → 在 ChromeOS 界面里粘贴」与
-   ChromeOS 输入法打字仍需人工在 host 侧确认；长时间稳定性、真实 GPU 加速
-   路径，以及「把 `wayland-0` / `:0` 整套切换一整轮」的演练也未覆盖。
-   `--peer-pid` / `--client-fd` 经复查只是主线 parent 内部 fork 参数，**不是
-   替换阻塞项**。详见 `docs/MAINLINE_PARITY.md` §4 / §4.1 / §5。
-2. **与主线仍有实现路径差距**：`wl_drm` 本地模拟、`zcr_text_input_crostini_v1` /
-   `zcr_text_input_x11_v1`、`zaura_output` / `zxdg_output_v1` 内部订阅已在
-   `v0.3.6-r` 补齐；仍存在差距的是 `--viewport-resize` 的指针补偿、
-   `wl_output.mode` 的 wire 数值公式、`sl_calculate_scale_for_xwayland` 完整重算、
+   Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通，**`wayland-0` / `:0`
+   整套替换也已在真机演练并自动回滚**（切换态 wire 探针、Xwayland、WM、
+   真实 X11 窗口、`wl_drm` PRIME、RandR 全 PASS）。仍需人工在 host 侧确认
+   的是「X11 复制 → 在 ChromeOS 界面里粘贴」与输入法打字；长时间稳定性、
+   真实 GPU 加速路径也未覆盖。详见 `docs/MAINLINE_PARITY.md` §4 / §5.7。
+2. **与主线仍有实现路径差距**：`wl_drm` 本地模拟、Crostini IME 协议、
+   `zaura_output` / `zxdg_output_v1` 内部订阅、`--peer-pid` / `--client-fd`
+   真实语义与 `--timing-filename` / `--stats-*` / `--trace-*` 均已在
+   `v0.3.6-r` 补齐；Xwayland scale 重算与 `wl_output.mode` wire 公式已用
+   回归测试锁定与主线等价。仍存在差距的是 `wl_pointer` 坐标变换（整套事件
+   纯转发，`viewport_pointer_scale` 未接入）、stylus-v2 协议转换、
    X11 屏幕 DPI（见下）、explicit fence / seccomp，以及 parent 用共享 runtime
    上的 per-client task 而非 fork 子进程（功能等价，真机多客户端探针 PASS）。见
    [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §4 / §4.1 与
@@ -201,9 +202,10 @@ docs/                  当前架构、安装指南、功能矩阵、剪贴板对
    校验 serial 的 compositor 可能拒绝这一次导出。
 
 **想把主线整个换掉？** 默认安装始终保持共存；`v0.3.6-r` 起提供可灰度、
-可一键回滚的替换手册：[`docs/REPLACE_MAINLINE.md`](docs/REPLACE_MAINLINE.md)。
-启动参数映射、`--parent` 多客户端、单实例 Wayland+X11 已在真机逐项验证；
-完整切换演练与 host 侧人工确认仍需你点头后执行。
+可一键回滚、且**已在真机完整演练并自动回滚**的替换手册：
+[`docs/REPLACE_MAINLINE.md`](docs/REPLACE_MAINLINE.md)。启动参数映射、
+`--parent` 多客户端、单实例 Wayland+X11、整套 drop-in 切换与回滚均已在真机
+逐项验证；剩下需要你亲自确认的只有 ChromeOS host 侧粘贴 / IME 与长期稳定性。
 
 ## 版本里程碑
 
@@ -217,6 +219,7 @@ docs/                  当前架构、安装指南、功能矩阵、剪贴板对
 | `v0.3.4-r` | **Debian `.deb` 交付与 Crostini 安装指南**：`packaging/build-deb.sh`（release + strip + `dpkg-shlibdeps` 自动解析依赖 + 两个 systemd user 模板 + 全量文档），`docs/CROSTINI_INSTALL.md` 覆盖安装、与主线共存、Wayland/X11/systemd 三种启动、参数速查、故障排查与卸载；`.deb` 已实机 `dpkg -i` 安装、两个 systemd 单元实测通过。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §5.4 |
 | `v0.3.5-r` | **历史包袱清理**（无功能变更）：删除死文件、未用依赖与零调用符号，移除半接线的停机分支，统一 CRLF→LF 并去掉打包脚本的行尾兼容补丁，精简合并期过程文档、修正过时表述，release workflow 改为产出 `.deb`。主线 CLI 兼容面与三套 transport 保持不变 |
 | `v0.3.6-r` | **继续补齐主线缺失能力**：本地模拟 `wl_drm` v2（`device`/`format`/`authenticated`/`capabilities`/`create_prime_buffer` → host dmabuf v2），真机 Xwayland 不再打印 `glamor: 'wl_drm' not supported` / `falling back to sw`；新增 `zcr_text_input_crostini_manager_v1` / `zcr_text_input_crostini_v1` / `zcr_text_input_x11_v1` 本地 IME 协议；内部订阅 `zaura_output`（scale / connection / device_scale_factor）与 `--direct-scale` 下的 `zxdg_output_v1`，Direct 模式改用真实 logical size，DSF 缺省值与主线一致（1.0）；`BadWindow` 改用 unchecked 请求、`host_serial == 0` 不再告警、扩展输入 serial 采集。真机 154 个测试全绿、release 0 warning、wire 探针 25 globals / `wl_drm` + IME 全部 PASS。另复查主线启动链路后新增 [`docs/REPLACE_MAINLINE.md`](docs/REPLACE_MAINLINE.md)（可灰度、可回滚的替换手册），并更正 `--peer-pid` 并非替换阻塞项。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §4.1 / §5.6 |
+| `v0.3.7-r` | **收尾与发布**：补齐 `--peer-pid` / `--client-fd` 的真实语义（`SO_PEERCRED`、`Context.client_pid`、预连接 fd）与 `--timing-filename` / `--stats-*` / `--trace-*` 可观测性实现（`stats.rs`），用回归测试锁定 Xwayland output wire 与主线等价；新增 [`docs/REPLACE_MAINLINE.md`](docs/REPLACE_MAINLINE.md) 并在真机完成 `wayland-0` / `:0` 整套切换演练 + 自动回滚；修正架构文档过时的 delegation 计数、全面对齐差距表与验证记录。160 个测试、release 0 warning、`.deb` 实机安装验证。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §5.7 / §5.8 |
 
 ## 其他说明
 

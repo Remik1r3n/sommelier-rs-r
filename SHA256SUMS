@@ -1,0 +1,4 @@
+# sommelier-rs-r v0.3.7-r release artifact
+# Verify from the directory that contains both the .deb and this file:
+#   sha256sum -c SHA256SUMS
+64250949bd81ecd829007650750e72eb505acf9b2f6ef82539393d81c8a93d81  sommelier-rs-r_0.3.7-r_amd64.deb

@@ -18,6 +18,7 @@ use crate::config::{Config, TransportKind};
 use crate::connection::WaylandConnection;
 use crate::protocols;
 use crate::state::Context;
+use crate::stats::Stats;
 use crate::transform::Transform;
 use crate::virtgpu_channel::VirtGpuChannel;
 use crate::virtwl_channel::VirtWaylandChannel;
@@ -110,6 +111,8 @@ struct Client {
     wm_commands: Option<UnboundedReceiver<WmCommand>>,
     x11: Option<Arc<X11Bridge>>,
     toplevels: HashMap<u32, HostToplevel>,
+    /// Shared across all client tasks of a `--parent` process.
+    stats: Arc<Stats>,
 }
 
 impl Client {
@@ -120,8 +123,11 @@ impl Client {
         bridge: Option<Arc<X11Bridge>>,
         wm_commands: Option<UnboundedReceiver<WmCommand>>,
         is_xwayland_client: bool,
+        stats: Arc<Stats>,
+        peer_pid: Option<u32>,
     ) -> Self {
         let mut ctx = Context::new(cfg.gpu_accel, cfg.xdg_decoration);
+        ctx.client_pid = peer_pid;
         ctx.apply_runtime(
             cfg.transform(),
             cfg.quirks.clone(),
@@ -154,6 +160,7 @@ impl Client {
             wm_commands,
             x11: bridge,
             toplevels: HashMap::new(),
+            stats,
         }
     }
 
@@ -211,6 +218,8 @@ impl Client {
             }
             self.poll_selection().await;
         }
+        // Emit the final CSV sample / trace flush for this connection.
+        self.stats.finish();
     }
 
     /// Drive the X11 <-> Wayland clipboard state machine and flush any
@@ -281,6 +290,8 @@ impl Client {
     }
 
     async fn handle_msgs(&mut self, direction: Direction) -> bool {
+        // Clone before splitting `self` into disjoint connection borrows.
+        let stats = self.stats.clone();
         let (conn, other_conn) = match direction {
             Direction::ClientToHost => (&mut self.client_conn, &mut self.host_conn),
             Direction::HostToClient => (&mut self.host_conn, &mut self.client_conn),
@@ -323,6 +334,19 @@ impl Client {
                     .or_else(|| guest_id.and_then(|gid| self.ctx.shadow_table.get_interface(gid)))
                     .cloned(),
             };
+
+            // wl_surface.frame is request opcode 3 in the core protocol;
+            // mainline counts these as frame-pacing events.
+            let is_frame = matches!(direction, Direction::ClientToHost)
+                && interface.as_deref() == Some("wl_surface")
+                && opcode == 3;
+            stats.record(
+                matches!(direction, Direction::ClientToHost),
+                interface.as_deref(),
+                opcode,
+                len,
+                is_frame,
+            );
 
             // X11 WM needs host configure/close events for toplevels it created.
             let is_x11_toplevel_event = self.ctx.is_xwayland_client
@@ -1069,24 +1093,55 @@ fn set_nonblocking(fd: RawFd) {
     }
 }
 
+/// Read the peer's pid from a connected AF_UNIX socket. Mainline's parent
+/// obtains the same value via `SO_PEERCRED` and passes it as `--peer-pid`
+/// (sommelier.cc:3970-3996); our parent keeps the client in-process, so it
+/// reads the credential directly on `accept()`.
+fn so_peercred_pid(fd: RawFd) -> Option<u32> {
+    let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize >= std::mem::size_of::<libc::ucred>() && ucred.pid > 0)
+        .then_some(ucred.pid as u32)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_client(
     client_fd: RawFd,
     cfg: Config,
     bridge: Option<Arc<X11Bridge>>,
     wm_commands: Option<UnboundedReceiver<WmCommand>>,
     is_xwayland_client: bool,
+    stats: Arc<Stats>,
 ) {
+    // An explicit --peer-pid wins; otherwise recover it from the socket, just
+    // as mainline's parent does before forking the worker.
+    let peer_pid = cfg
+        .peer_pid
+        .filter(|p| *p > 0)
+        .map(|p| p as u32)
+        .or_else(|| so_peercred_pid(client_fd));
     set_nonblocking(client_fd);
     let client_conn = WaylandConnection::new(client_fd);
     tokio::spawn(async move {
         let Some((host_conn, virtwl, virtgpu)) = connect_host(&cfg).await else {
             log::error!("Failed to establish host connection, closing client");
+            stats.finish();
             return;
         };
         log::info!(
-            "Client connected via {} (x11={})",
+            "Client connected via {} (x11={}, peer_pid={:?})",
             host_conn.transport_name(),
-            is_xwayland_client
+            is_xwayland_client,
+            peer_pid
         );
         let mut client = Client::new(
             client_conn,
@@ -1095,6 +1150,8 @@ fn spawn_client(
             bridge,
             wm_commands,
             is_xwayland_client,
+            stats,
+            peer_pid,
         );
         client.ctx.virtwayland_channel = virtwl;
         client.ctx.virtgpu_channel = virtgpu;
@@ -1154,19 +1211,52 @@ pub async fn run(
         crate::notify_systemd();
     }
 
+    // One shared stats stream for every client of this process. Mainline
+    // drives `--stats-timer` off the host event loop; a single timer task here
+    // is the equivalent for our shared-runtime parent.
+    let stats = Stats::new(cfg.stats.clone());
+    if stats.enabled() {
+        let period = stats.period();
+        let ticker = stats.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                ticker.sample();
+            }
+        });
+    }
+
+    // Mainline's parent passes an already-accepted fd to the worker via
+    // `--client-fd` (sommelier.cc:3997-3998). Honour it as the first client so
+    // an external caller can still attach a connection directly.
+    if let Some(fd) = cfg.client_fd.filter(|fd| *fd >= 0) {
+        log::info!("Serving pre-connected --client-fd={}", fd);
+        spawn_client(fd, cfg.clone(), bridge.clone(), None, false, stats.clone());
+    }
+
     // Xwayland is a Wayland client of ours, but it must be identifiable so
     // that its wl_surface IDs can be published to the X11 WM. It arrives on a
     // dedicated socketpair passed as WAYLAND_SOCKET, not via the listener.
     if let Some(fd) = xwayland_client_fd {
         log::info!("Starting dedicated Xwayland client (fd={})", fd);
-        spawn_client(fd, cfg.clone(), bridge.clone(), wm_commands, true);
+        spawn_client(
+            fd,
+            cfg.clone(),
+            bridge.clone(),
+            wm_commands,
+            true,
+            stats.clone(),
+        );
     }
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let fd = stream.into_std().unwrap().into_raw_fd();
-                spawn_client(fd, cfg.clone(), bridge.clone(), None, false);
+                spawn_client(fd, cfg.clone(), bridge.clone(), None, false, stats.clone());
             }
             Err(e) => log::error!("Accept error: {}", e),
         }

@@ -62,7 +62,7 @@
 | DSF 缺省值与主线一致 | ✅ | 主线 `sl_create_host_output` 把 `device_scale_factor` 初始化为 1000（1.0），仅在 aura 事件到达后覆盖；Rust 同样缺省 1.0，不再拿整数 `wl_output.scale` 兜底 |
 | `wp_fractional_scale_v1.preferred_scale` 改写 | ✅ | `handler/output.rs` |
 | 多输出布局、按位置推断输出、虚拟桌面尺寸 | ✅ | `transform.rs::set_outputs` / `virtual_dimensions` |
-| per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通。已可用，但未复刻主线 `viewport_pointer_scale` 指针补偿（见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4） |
+| per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通。已可用；主线 `wl_pointer` 坐标变换 + `viewport_pointer_scale` 整层尚未接入生产路径（见 §6 第 4 项与 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4） |
 | `wl_surface.damage_buffer` 支持开关 | ✅ | 与主线 `sommelier-compositor.cc:1170` 一致：guest global 固定 **v4**（`--no-support-damage-buffer` / `SOMMELIER_SUPPORT_DAMAGE_BUFFER≠1` 时 v3），host bind 恒 v3；v4 `damage_buffer` 请求由 `handler/compositor.rs` 改写为按坐标系变换的 `damage` |
 | `preferred_scale` 严格等价于主线 `round(wire_scale / scale)` | ✅ | 保留 1/120 精度，不再量化到 120 的整数倍；含分数 scale 单测 |
 
@@ -130,13 +130,13 @@
 ## 6. 已知限制（按影响排序）
 
 1. **ChromeOS host 侧的人工交互尚未验证。** Wayland 与 X11 两条主链路已在
-   Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通（见 §7 与
-   [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5），但「X11 应用复制 → 在
-   ChromeOS 界面里粘贴」与 ChromeOS 输入法打字需要人工在 host 侧确认；
-   把 `wayland-0` / `:0` 整套 drop-in 切换一整轮（会中断当前桌面）、长时间
-   稳定性与真实 GPU 加速路径同样未覆盖。替换手册与就绪度评估见
-   [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) 与
-   [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4.1。
+   Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通；**`wayland-0` / `:0`
+   整套 drop-in 切换也已在真机演练并自动回滚**（见
+   [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §11 与
+   [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.7），切换态全项 PASS。
+   仍需人工在 ChromeOS host 侧确认的是「X11 应用复制 → 在 ChromeOS 界面里
+   粘贴」与输入法打字；长时间稳定性、真实 GPU 加速路径、替换态下注销重登
+   也未覆盖。就绪度评估见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4.1。
 2. **explicit fence**：`--explicit-fence` 与
    `zwp_linux_explicit_synchronization_v1` XML 就绪，但未接入
    `linux_explicit_synchronization` 的 fence 收发逻辑；该协议目前按内部
@@ -144,18 +144,25 @@
 3. **`--parent` 语义简化**：主线 fork 独立 worker 进程，本项目是同一进程内
    的 tokio task；隔离性弱于主线，但 `UnixListener` + `accept()` 循环的多客户端
    能力已在真机用两个独立 wire 探针验证 PASS。`--peer-pid` / `--client-fd`
-   只是主线 parent 内部 fork 参数，替换 parent 后自然消失，**不是替换阻塞项**。
-4. **大体积剪贴板载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，
+   只是主线 parent 内部 fork 参数，替换 parent 后自然消失，**不是替换阻塞项**；
+   且 `v0.3.6-r` 起二者已有真实语义（`SO_PEERCRED` + 预连接 fd）。
+4. **`wl_pointer` 坐标变换未接入**：主线 `sl_transform_pointer` 会做
+   host→guest fixed 变换并对 `viewport_override` 窗口乘
+   `viewport_pointer_scale`；本项目 `wl_pointer` 事件是纯转发，
+   `Transform::host_to_guest_fixed` 目前只在单测中调用。`--viewport-resize`
+   仅换算 `wp_viewport.set_destination`。默认关闭该 flag 时不影响真机
+   已验证路径，详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
+5. **大体积剪贴板载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，
    上限 4 MiB；超过上限或非预取类型由延迟 `SelectionRequest` 触发按需
    获取，1.5 s 内未取到会按 ICCCM 回复 property NONE。X11 → host / guest
    Wayland 方向不受此限制（`ConvertSelection` 直接回写 fd）。
-5. **`wl_data_device.set_selection` 的 serial 可能为 0**：`Context::host_serial`
+6. **`wl_data_device.set_selection` 的 serial 可能为 0**：`Context::host_serial`
    由 host 输入事件提取；进程刚启动尚未收到输入时复制，会带 serial 0 发送
    （主线 `seat->last_serial` 初值同样为 0 且照常发送，`v0.3.6-r` 起不再打印
    warning，并扩展了 pointer / keyboard / touch / data_device 的 serial 采集
    opcode）。若 ChromeOS compositor 严格校验 serial，这一次导出可能被拒绝，
    下一次输入事件后恢复正常。
-6. **X11 screen DPI 与主线 :0 不同**：`xrandr` 的 RandR monitor 已是主线同款
+7. **X11 screen DPI 与主线 :0 不同**：`xrandr` 的 RandR monitor 已是主线同款
    `1920x1280 / 406x270mm`（120 DPI），但 `xdpyinfo` 的 X screen 仍为
    `508x339mm`（96 DPI）。Xwayland 的 `update_screen_size()` 用
    `width * 25.4 / monitorResolution` 计算 screen mm，该值在 X server 启动时
@@ -165,7 +172,7 @@
    前已完成输出握手。影响范围仅限读取 `Xft.dpi` 的老式 X11 应用，Wayland
    客户端与 RandR 几何不受影响。详见
    [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
-7. **`current_thread` Tokio runtime 是硬约束**：`KeyboardHandler` 中的
+8. **`current_thread` Tokio runtime 是硬约束**：`KeyboardHandler` 中的
    `xkbcommon` 对象 `!Send`，依赖 `unsafe impl Send`；任何改为多线程 runtime
    的尝试都会破坏该不变量。剪贴板的管道读写也因此用 `tokio::fs` 的
    blocking pool 完成，不占 runtime 线程。
@@ -177,11 +184,12 @@
 | `cargo check --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | build script 生成 | ✅ 33 个协议模块 + 1 个聚合模块（34 个 include） |
-| 单元测试 | **154 个 `#[test]` 在真实 Crostini（Debian 13 / `penguin`）上全部运行通过**（150 + 4 + 0 doc-tests）；`v0.3.6-r` 新增 `wl_drm` 本地事件/PRIME 转换、crostini IME、DSF 修正 DPI 与 output state 重发、内部 xdg logical size、Direct 模式真实 logical size 等测试 |
+| 单元测试 | **160 个测试在真实 Crostini（Debian 13 / `penguin`）上全部运行通过**（`cargo test --workspace --locked`：156 + 4 + 0 doc-tests，0 warning）；`v0.3.6-r` 新增 `wl_drm` 本地事件/PRIME 转换、crostini IME、DSF 修正 DPI 与 output state 重发、内部 xdg logical size、Direct 模式真实 logical size（当时共 154 个）；`v0.3.7-r` 再新增主线 output wire 公式等价性、stats 日志与 CLI 映射等测试（共 160 个） |
 | CLI 参数解析 | ✅ 用独立 clap crate 在 Windows 本机**实跑** 6 组形状验证全部通过：`--socket` vs `--display`、位置参数 runprog、`--` 分隔、`--sd-notify` 不吃位置参数、全量主线 flag 拼写、`--help`/`--version` |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
 | Rust 源码规模 | 约 1.9 万行（`sommelier/src` + `wayland_codegen/src`；用 `git ls-files "*.rs" | xargs wc -l` 复核） |
 | 真机端到端 | **已验证**：virtwl → host globals/事件、guest registry 与版本钳制、`gtk_shell1`/text-input-v3 synthetic global、Xwayland `:9` 启动、WM 管理真实 X11 窗口并映射为 host `xdg_toplevel`、RandR 模拟、X11 ↔ guest 剪贴板往返、键盘焦点。详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5 |
-| 真实设备运行 | ✅ 已在 Debian 13 / `penguin` / `/dev/wl0` 真机运行（独立 `wayland-wb` / `:9`，现役 `wayland-0/1`、`:0/:1` 未受影响）；仍未覆盖 host 侧人工交互，见 §6 第 1 项 |
+| 真实设备运行 | ✅ 已在 Debian 13 / `penguin` / `/dev/wl0` 真机运行（独立 `wayland-wb` / `:9`），并完成一次 `wayland-0` / `:0` 整套替换演练 + 自动回滚（切换态 wire 探针、Xwayland、WM、真实 X11 窗口、`wl_drm` PRIME、RandR 全 PASS；回滚后 5 个单元与全部环境变量复原）。见 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §11；仍未覆盖 host 侧人工交互，见 §6 第 1 项 |
+| 可观测性参数 | ✅ `--timing-filename` / `--stats-log`（CSV 采样）、`--stats-summary`（实时快照）、`--stats-timer=SECS`、`--trace-filename` / `--trace-system`（逐消息 trace）真机实测全部落盘；`--peer-pid` / `--client-fd` 真机日志实测 `peer_pid=Some(20355)` |
 | Debian `.deb` 交付 | ✅ `packaging/build-deb.sh` 在真机上构建 `sommelier-rs-r_<版本>_amd64.deb`（release + strip + `dpkg-shlibdeps` 解析依赖），随包附带两个 disabled-by-default systemd user 模板与全量文档；已实机 `dpkg -i` 安装并验证两个单元均秒级 `active`。安装与使用见 [`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)，打包验证见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.4 |

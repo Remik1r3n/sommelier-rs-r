@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "sommelier"
-version = "0.3.6-r"
+version = "0.3.7-r"
 dependencies = [
  "clap",
  "env_logger",

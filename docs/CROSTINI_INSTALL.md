@@ -29,20 +29,28 @@ ls -l /opt/google/cros-containers/bin/Xwayland   # 用 -X 时需要
 ## 1. 把 `.deb` 放进容器
 
 包名格式：`sommelier-rs-r_<版本>_amd64.deb`，例如
-`sommelier-rs-r_0.3.6-r_amd64.deb`。
+`sommelier-rs-r_0.3.7-r_amd64.deb`。
 
 三种方式任选：
 
 ```bash
 # A. 从 ChromeOS「文件」应用把 .deb 放进 Linux 文件 / MyFiles/Downloads
-sudo dpkg -i /mnt/chromeos/MyFiles/Downloads/sommelier-rs-r_0.3.6-r_amd64.deb
+sudo dpkg -i /mnt/chromeos/MyFiles/Downloads/sommelier-rs-r_0.3.7-r_amd64.deb
 
 # B. 从别的机器 scp 进来（把地址换成你的容器地址）
-scp -P <port> sommelier-rs-r_0.3.6-r_amd64.deb <user>@<container-ip>:~/
-sudo dpkg -i ~/sommelier-rs-r_0.3.6-r_amd64.deb
+scp -P <port> sommelier-rs-r_0.3.7-r_amd64.deb <user>@<container-ip>:~/
+sudo dpkg -i ~/sommelier-rs-r_0.3.7-r_amd64.deb
 
 # C. 直接在容器里从源码重建（见 §10）
 bash packaging/build-deb.sh
+```
+
+本次 `v0.3.7-r` 发布产物的 SHA-256 记录在仓库根目录的 `SHA256SUMS`
+（该文件不随 `.deb` 分发，避免自引用）。把 `.deb` 与 `SHA256SUMS`
+放在同一目录后执行：
+
+```bash
+sha256sum -c SHA256SUMS
 ```
 
 如果 `dpkg -i` 提示缺少依赖：
@@ -65,7 +73,7 @@ sudo apt-get -f install -y
 确认安装结果：
 
 ```bash
-sommelier-rs-r --version        # 0.3.6-r
+sommelier-rs-r --version        # 0.3.7-r
 dpkg -L sommelier-rs-r          # 查看装了哪些文件
 sommelier-rs-r --help | head -20
 ```
@@ -313,9 +321,12 @@ sommelier-rs-r --transport=virtgpu --force-drm-device=/dev/dri/renderD128 --sock
 - **推荐可灰度、可回滚**：用 drop-in 覆盖 `sommelier-x@0.service` 的
   `ExecStart`，mask `sommelier@0.service`，保留 `sommelier@1` /
   `sommelier-x@1` 主线不动作为应急与 A/B 对照。回滚只删用户级 drop-in。
+- **整套切换已在真机演练并自动回滚**（手册 §11）：切换态 wire 探针、
+  Xwayland `:0`、WM、真实 X11 窗口、`wl_drm` PRIME、RandR `406x270mm`
+  全部 PASS，保留的主线 `@1` 全程可用；回滚后 5 个单元与全部环境变量复原。
 - **仍需人工确认**：ChromeOS host 侧复制粘贴与 IME、长期稳定性、真实 GPU
-  加速；以及「把 `wayland-0` / `:0` 整套切过去一整天」的完整演练尚未在真机
-  执行（会中断当前桌面，需要你确认后再做）。
+  加速，以及「替换态下注销再登录」。演练虽然已回滚，正式切换仍会关掉
+  当前 `:0` 上的窗口，动手前先保存工作。
 - **已知降级**：`xdpyinfo` X screen 仍是 96 DPI（`xrandr` monitor 已与主线
   一致），用 `~/.sommelierrc` 写 `Xft.dpi: 120` 兜底，详见手册 §10。
 
@@ -357,7 +368,7 @@ ls -lh dist/sommelier-rs-r_*_amd64.deb
 | `glamor: 'wl_drm' not supported` | `v0.3.5-r` 及更早的已知差距；`v0.3.6-r` 起代理本地模拟 `wl_drm` v2，升级后该日志与 `falling back to sw` 都应消失。若仍出现，检查 `SOMMELIER_DRM_DEVICE` / `/dev/dri/renderD*` 是否存在 |
 | `No such file or directory: /dev/wl0` | 指定 `--transport=unix --display=...`，或检查 Linux 容器是否正常运行 |
 | 安装时 `apt-get -f install` 报第三方源无 Release | 修复/临时禁用该源；本包只依赖 Debian 官方仓库的运行时库 |
-| 日志里 `BadWindow` 警告 | X11 窗口退出时的无害竞态；`v0.3.6-r` 起 `ChangeWindowAttributes` 改为 unchecked、X11 error 降为 debug，正常日志里不再出现 |
+| 日志里 `BadWindow` 警告 | X11 窗口退出时的无害竞态；`v0.3.6-r` 起 `ChangeWindowAttributes` 改为 unchecked、X11 error 降为 debug，不再作为 warning 出现。若开启了 DEBUG 日志，仍会看到 `x11: ignoring BadWindow packet` 记录，这是预期行为，可忽略 |
 | `xdpyinfo` 显示 96 DPI（`:0` 是 120 DPI） | 已知差距，见 `MAINLINE_PARITY.md` §4。`xrandr` 的 RandR monitor 已是正确的 `406x270mm`；X screen 的 `monitorResolution` 由 Xwayland 启动时固定，代理侧无法改写。若老式 X11 应用偏小，可手动 `echo "Xft.dpi: 120" \| xrdb -merge` |
 | 应用窗口不显示 / 键盘没焦点 | 看代理日志是否有 `X11 window ... -> host surface ...`；确认应用连的是 `:9` 而不是 `:0` |
 
@@ -392,14 +403,20 @@ sudo dpkg -P sommelier-rs-r     # 彻底清除
 ## 13. 验证状态
 
 Wayland / X11 主链路与 `.deb` 安装均已在 Debian 13 / `penguin` / `/dev/wl0`
-真机端到端验证（`v0.3.6-r`：154 个单元测试全绿、25 个 guest globals、
-`wl_drm` v2 与两个 Crostini IME global 的 wire 探针 PASS、Xwayland `:9`
-真实窗口、glamor 不再回退软件渲染、剪贴板往返、两个 systemd user 模板
-秒级 `active`），逐项记录见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md)
-§5.2 / §5.4 / §5.6。
+真机端到端验证（`v0.3.7-r`：**160 个单元测试全绿**、release 0 warning、
+25~26 个 guest globals、`wl_drm` v2 与两个 Crostini IME global 的 wire 探针
+PASS、Xwayland `:9` 真实窗口、glamor 不再回退软件渲染、剪贴板往返、
+两个 systemd user 模板秒级 `active`；`--timing-filename` / `--stats-*` /
+`--trace-*` 与 `SO_PEERCRED` peer pid 均实测落盘/生效；最终 `.deb` 已
+`dpkg -i` 实机安装并重新跑通 wire 探针 / X11 冒烟）。逐项记录见
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.2 / §5.4 / §5.6 / §5.7 / §5.8。
+
+**`wayland-0` / `:0` 整套主线替换也已在真机演练并自动回滚**（切换态全项
+PASS、5 个单元与全部环境变量复原），手册见
+[`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §11。
 
 已知差距：X11 `xdpyinfo` 的 X screen 仍为 96 DPI（`xrandr` 的 RandR
-monitor 已与主线同为 120 DPI）；详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
-替换主线的完整操作手册见 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md)。
-未覆盖：ChromeOS host 侧人工粘贴与 IME、**把 `wayland-0` / `:0` 整套 drop-in
-切换一整轮**（会中断当前桌面，需确认后执行）、长时间稳定性、真实 GPU 加速路径。
+monitor 已与主线同为 120 DPI）、`wl_pointer` 坐标变换未接入；详见
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
+未覆盖：ChromeOS host 侧人工粘贴与 IME、长时间稳定性、真实 GPU 加速路径、
+替换态下注销重登。

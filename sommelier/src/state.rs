@@ -433,6 +433,11 @@ pub struct Context {
     pub selection: Arc<Mutex<crate::x11::SelectionBridge>>,
     /// True for the dedicated Wayland connection used by Xwayland itself.
     pub is_xwayland_client: bool,
+    /// PID of the process on the other end of this guest connection. Mainline
+    /// passes it as `--peer-pid` when the parent forks a worker; our parent
+    /// reads `SO_PEERCRED` on `accept()` instead. Used for connection logs and
+    /// as the fallback client identity.
+    pub client_pid: Option<u32>,
     /// Coordinate/DPI scaling state (mainline sommelier-transform / -output).
     pub transform: Transform,
     /// Raw `--scale` value (mainline `ctx.desired_scale`). Applied to
@@ -569,6 +574,7 @@ impl Context {
             x11_bridge: None,
             selection: Arc::new(Mutex::new(crate::x11::SelectionBridge::default())),
             is_xwayland_client: false,
+            client_pid: None,
             transform: Transform::new(1.0, crate::transform::ScalingMode::Normal, vec![]),
             desired_scale: 1.0,
             quirks: Arc::new(Quirks::new()),

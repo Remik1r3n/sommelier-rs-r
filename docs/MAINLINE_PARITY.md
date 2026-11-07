@@ -8,6 +8,9 @@
 输出几何、INCR 阈值等 30 余处语义偏差已修正**；`v0.3.6-r` 又补齐了
 `wl_drm` v2 本地模拟、两个 Crostini 私有 IME 协议、`zaura_output` /
 `zxdg_output_v1` 内部订阅与 Direct 模式真实 logical size 换算（见 §1.6）。
+`v0.3.7-r` 补齐 `--timing-filename` / `--stats-*` / `--trace-*` 可观测性实现
+与 `--peer-pid` / `--client-fd` 的真实语义（`SO_PEERCRED`），用回归测试锁定
+Xwayland output wire 与主线等价，并完成整套替换演练与发布回归（§5.7 / §5.8）。
 用户明确要求保留的新协议能力、以及少数无法在单进程代理架构下 1:1
 复刻的路径，列在 §3 / §4，属于有意保留或有据可查的已知差距，不是遗漏。
 
@@ -159,20 +162,24 @@
 
 `v0.3.6-r` 已把 §4 中的 `wl_drm` 本地模拟、Crostini IME 协议、
 `zaura_output` / `zxdg_output_v1` 内部订阅、`host_serial == 0` 告警与
-`BadWindow` 竞态 5 类差距补齐（见 §1.6）。以下为**复查后仍然成立**的差距。
+`BadWindow` 竞态 5 类差距补齐（见 §1.6）。随后又补齐了
+`--peer-pid` / `--client-fd` 的真实语义与 `--timing-filename` /
+`--stats-*` / `--trace-*` 的可观测性实现，并完成了整套主线替换演练
+（见 §5.7）。以下为**复查后仍然成立**的差距；带 ✅ 的两项已用回归测试
+锁定与主线等价，不再作为待办。
 
 | 项 | 主线 | Rust 现状 | 原因 |
 |---|---|---|---|
 | **X11 screen DPI** | `:0` 的 `xdpyinfo` 为 `1920x1280 (406x270mm)` / 120 DPI | `:9` 的 `xrandr` monitor 已是主线同款 `406x270mm`，但 `xdpyinfo` X screen 仍为 `508x339mm` / 96 DPI | Xwayland `update_screen_size()` 用 `width × 25.4 / monitorResolution` 计算 screen mm，该值在 X server 启动时固定。真机三项实验均证明代理侧无法改变：① 让首帧即以 DSF=1.25 发 geometry；② Xwayland 启动加 `-dpi 120`；③ 运行时 `xrandr --dpi 120` / `--fb --dpi`。根因是本项目的**每 guest client 独立 host 连接**：host 输出握手晚于 Xwayland 初始化，主线共享 host display 则在启动 Xwayland 前已完成。影响仅限读取 `Xft.dpi` 的老式 X11 应用 |
-| `sl_calculate_scale_for_xwayland` 的完整重算 | Xwayland ready 后 `ctx.scale = desired_scale × DSF × preferred_scale`，并 round/clamp（`:3507-3549`） | 已消费 `scale` / `preferred_scale` / DSF 并重发 output state，但未把三者完整乘回 `ctx.scale` | 需要把 internal output 的 `preferred_scale` 与 DSF 一并注入 `Transform`；当前 `wp_viewporter` 分支只应用 `desired_scale` |
-| `wl_output.mode` 宽高公式 | `host_w × ctx.scale × s / applied_scale`（含 aura_shell 的 `applied_scale`） | `trunc(host_w × ctx.scale)` | 两者算出的**逻辑尺寸**一致（Rust 用整数 `wl_output.scale` 承载差值），但 wire 上的 size/scale 数值不同 |
+| ✅ `sl_calculate_scale_for_xwayland` 的完整重算 | Xwayland ready 后 `ctx.scale = desired_scale × DSF × preferred_scale`，并 round/clamp（`:3507-3549`） | **不折叠 DSF 进 `Transform.scale`**：DSF 单独存于 `OutputGeometry`，用于 DPI 与 direct 模式；`host_to_guest_size = host_w × desired_scale` | 主线把 DSF 乘进 `ctx.scale` 后又在 `sl_output_get_host_output_state` 里用 `applied_scale = DSF × current_scale` 除掉，只要 `preferred_scale == current_scale` 两者就化简为同一个 `host_w × desired_scale`。硬套主线公式会**双重应用 DSF**，破坏真机已验证的 96→120 DPI 两阶段 output 序列。`output.rs::xwayland_wire_state_matches_mainline_formula` 对 desired=1/2/3 锁定该等价性。**剩余差异**：用户 zoom 使 `preferred_scale ≠ current_scale` 时，主线会额外乘 `preferred/current`，我们不会；该场景非默认且未在真机覆盖 |
+| ✅ `wl_output.mode` 宽高公式 | `host_w × ctx.scale × s / applied_scale`（含 aura_shell 的 `applied_scale`） | `trunc(host_w × desired_scale)`，X11 client 强制整数 scale=1 | 同上：默认参数下 guest **逻辑尺寸与 scale=1 与主线完全一致**（已由上述测试锁定）。差异出现在普通 Wayland client 的 wire `wl_output.scale`：主线 `s = ceil(current/(desired×preferred))`，我们用 `ceil(host_scale/desired)`。整体重构 `Transform` 的坐标基准会影响所有已验证的坐标换算，收益低于回归风险，故保留并如实记录 |
 | Crostini IME 的 XID → surface 解析 | 共享 host display，可直接找到 Xwayland 的 host `wl_surface` | 非 Xwayland 连接走内部创建的 placeholder `wl_surface` | 每 client 独立 host connection 导致 XID 关联表不在同一连接上；真实 ChromeOS host 侧人工 IME 输入尚未验证 |
-| `--viewport-resize` | 在 surface commit 时用 `window->viewport_width/height` 覆盖 host viewport destination | 在 guest `wp_viewport.set_destination` 上按 scale 换算 | 实现路径不同，效果接近；未复刻 `viewport_pointer_scale` 指针补偿 |
+| `wl_pointer` 坐标变换 / `viewport_pointer_scale` | `sl_transform_pointer`（`sommelier-transform.cc:302-315`）先做 host→guest fixed 变换，再对 `viewport_override` 窗口乘 `viewport_pointer_scale` | **整套 `wl_pointer` 事件是纯转发**；`Transform::host_to_guest_fixed` 只在单测中被调用，生产路径未接入；viewport 只换算 `set_destination` | 本轮复核发现这是一层比"缺指针补偿"更基础的差距：补偿依赖 surface↔window↔viewport_override 关联与主坐标变换链。不引入半成品，如实列为剩余差距。因为 `--viewport-resize` 默认关闭且真机坐标工作在已验证路径上，未观察到功能故障 |
 | `zaura_shell` → `zwp_tablet_manager_v2`（stylus） | stylus-v2 协议转换 | 透传 tablet-v2 | 主线做的是协议转换，Rust 保留直接透传 |
-| `--peer-pid` / `--client-fd` / `--peer-cmd-prefix` | parent 内部 fork worker 时传 client pid 与 fd，用于 client 身份 / app_id 推断（`:3962-4022`） | 只解析、不实现；parent 换成我们之后这两个参数自然消失 | **不是替换阻塞项**：真机 grep 容器脚本与 systemd 单元无外部 caller，仅主线 parent 自调用；早期文档把它列为阻塞项属误判，已在 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §2 更正。实际代价是缺少 peer pid → app_id 关联 |
-| `--timing-filename` / `--stats-*` / `--trace-*` | Perfetto / 帧统计 | 只解析、不实现 | 可观测性功能，不影响协议兼容 |
+| ~~`--peer-pid` / `--client-fd`~~ | parent 内部 fork worker 时传 client pid 与 fd（`:3962-4022`） | ✅ **已实现**：`accept()` 时取 `SO_PEERCRED` 得 pid（显式 `--peer-pid` 优先），注入 `Context.client_pid` 并写入连接日志；`--client-fd` 作为首个预连接 client 服务 | 真机实测 `peer_pid=Some(20355)`。`--peer-cmd-prefix` 仍只解析（我们的 parent 不 fork，无需命令前缀）。早期文档称其为替换阻塞项属误判，见 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §2 |
+| ~~`--timing-filename` / `--stats-*` / `--trace-*`~~ | Perfetto / 帧统计 | ✅ **已实现**（`stats.rs`）：`--timing-filename` / `--stats-log` 输出 CSV 采样、`--stats-summary` 输出实时快照、`--stats-timer=SECS` 控制周期、`--trace-filename` 逐消息记录方向/接口/opcode/长度、`--trace-system` 附加进程头 | 不引入 Perfetto 依赖；全进程共享一个 `Stats`，`--parent` 下所有 client 汇总到同一份日志。真机实测 CSV 4 行采样、summary、trace 全部落盘 |
 | INCR 接收侧缓冲策略 | 必须先缓冲 64 KiB 再决定 one-shot / INCR（`:2219-2235`） | 采用预取缓存 + 按需 ConvertSelection | 阈值与 chunk 已对齐，驱动方式不同 |
-| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**（见 §5），Wayland 与 X11 两条主链路均打通，`wl_drm` / IME wire 探针 PASS | 仍未覆盖：ChromeOS **host 侧**粘贴/复制与 IME 的人工确认、**把 `wayland-0` / `:0` 整套 drop-in 切换一整轮**、长时间稳定性与真实 GPU 加速 |
+| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**：共存主链路、wire 探针、X11 冒烟，以及 **`wayland-0` / `:0` 整套 drop-in 切换演练并自动回滚**（见 §5.7） | 仍未覆盖：ChromeOS **host 侧**粘贴/复制与 IME 的人工确认、长时间稳定性与真实 GPU 加速 |
 
 ### 4.1 替换就绪度（`v0.3.6-r` 复查）
 
@@ -192,7 +199,7 @@
 | `Type=notify` | ✅ | `proxy.rs:1153` 在 listener bind 后发 `READY=1`；真机共存单元秒级 `active` |
 | 用户 `SOMMELIER_ACCELERATORS` override | ✅ 保留 | `state.rs:505` 读环境变量；drop-in 与用户 `override.conf` 共存 |
 | 结构差异（需注意） | ⚠️ | 主线是 parent + X11 两进程，我们单进程同时管 socket 与 Xwayland；`--socket` 默认 `wayland-0` 且每实例都 bind，两个 unit 都换时必须给 X11 那个显式改名，或改用单实例方案 |
-| 完整 drop-in 切换演练 | ❌ 未执行 | 会中断当前桌面上的 Linux 应用；需用户确认后按手册 §6→§8→§9 跑一整轮 |
+| 完整 drop-in 切换演练 | ✅ **真机已执行并自动回滚** | 按 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §6 切 `wayland-0` / `:0`，§8 验收清单全过，保留 `@1` 主线作 A/B，最后 trap 无条件回滚；详见 §5.7 |
 
 ---
 
@@ -355,3 +362,104 @@ SSH 开发机重启后重新连通（同一台 `penguin`），以下结果均在
 - 日志洁净度：不再出现 `BadWindow` 的 `select client window events failed`
   warning（改 unchecked + debug 降级），也不再出现 `host_serial == 0`
   的 `set_selection` warning（与主线一致，降为 debug）。
+
+### 5.7 主线替换演练（`v0.3.6-r`，真机）
+
+为把「能不能真的替换」从推测变为结论，在真机上执行了一次**受控、
+自动回滚**的完整切换（[`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §6 方案 B）。
+脚本带 `EXIT/HUP/INT/TERM` trap，**无论成功、失败或中断都无条件恢复主线**；
+`sommelier@1` / `sommelier-x@1` 全程保持运行作 A/B 对照与应急锚点。
+
+步骤：备份 user manager 环境 → 换入当次构建的新二进制 → 给
+`sommelier-x@0.service` 写单实例 drop-in（`--socket=wayland-0 -X
+--x-display=0 --sd-notify=READY=1 --no-exit-with-child` + 尾随
+`set-environment` / `. /etc/sommelierrc`）→ `systemd-analyze --user verify`
+通过 → stop + mask `sommelier@0` → start `sommelier-x@0` → 跑 §8 验收 →
+trap 回滚（删 drop-in、unmask、daemon-reload、恢复环境、重启主线与共存单元）。
+
+**切换态实测（全部 PASS）**：
+
+| 检查 | 结果 |
+|---|---|
+| `sommelier-x@0.service` | 秒级 `active`，`Type=notify` 正常收到 `READY=1` |
+| guest socket | `/run/user/1000/wayland-0` 由我们 bind |
+| wire 探针 | `TOTAL_GLOBALS 26`、`wl_drm` 全字段、IME binds OK、`RESULT PASS` |
+| Wayland 主链路 | geometry / mode / scale / done / seat capabilities 全 PASS，`errors=0` |
+| Xwayland `:0` | 启动、`WM initialized`、`_NET_SUPPORTING_WM_CHECK` 存在 |
+| 真实 X11 窗口 | `xmessage` 成功显示（`rc=0`） |
+| **`wl_drm` PRIME** | `:0` 上的 Xwayland 实际调用 `create_prime_buffer 104x54 / 106x56 fmt=0x34325258` |
+| RandR | `XWAYLAND0 connected 1920x1280 ... 406mm x 270mm`，与主线一致 |
+| 保留的主线 `@1` | 两个单元仍 `active`，`:1` 为 `960x640 (254x169mm)`，A/B 可用 |
+| 日志 | 无 `glamor` / `wl_drm` 报错，无 `BadWindow` warning（DEBUG 级记录属预期） |
+| X screen DPI | `xdpyinfo` 为 `508x339mm` / 96 DPI —— §4 首行的已知差距在替换态同样成立 |
+
+**回滚后复核**：drop-in 文件消失、mask symlink 移除；
+`sommelier@0/1`、`sommelier-x@0/1` 与共存
+`sommelier-rs-r-x@wayland-wbx` **5 个单元全部 `active`**；
+`:0` 恢复 `1920x1280 (406x270mm)` / 120 DPI / `Xft.dpi: 120`；
+`:9` 仍是共存实例的 `508x339mm`；
+`DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 DISPLAY_LOW_DENSITY=:1
+WAYLAND_DISPLAY_LOW_DENSITY=wayland-1` 四个环境变量全部恢复。
+
+**本轮新增能力的真机实测**：`--timing-filename` 按 `--stats-timer=1`
+产出 4 行 CSV 采样（8 requests / 69 events / 200 B / 2116 B），
+`--stats-summary` 输出实时快照，`--trace-filename --trace-system`
+逐消息记录 `C2H/H2C <interface> <opcode> <len>` 与进程头；
+`SO_PEERCRED` 在连接日志中给出 `peer_pid=Some(20355)`。
+`cargo test --workspace --locked` **160 个测试全绿**（156 + 4 + 0），
+`cargo build --release --locked` **0 warning**，`cargo fmt --check` 通过。
+
+**仍未覆盖**（代码无法自证）：ChromeOS host 侧人工复制粘贴与 IME 输入、
+连续数天的稳定性、真实 GPU 加速路径、注销重登后的长期自启。
+
+### 5.8 v0.3.7-r 发布回归
+
+演练使用的是 `0.3.6-r` 版本号但代码完全相同的构建产物；`v0.3.7-r` 在其上只做了
+版本号提升与文档收尾（差距表、验证记录、架构文档的 delegation 计数、
+替换手册的演练结论），因此对最终产物重新执行了一轮完整发布检查。
+全部在 Debian 13 / `penguin` / `/dev/wl0` 真机执行，结果如下。
+
+**构建与静态检查**（cargo/rustc 1.99.1）：
+
+- `cargo fmt --all -- --check` 通过（`FMT_RC=0`）；
+  `cargo test --workspace --locked` **160 个测试全绿**（156 + 4 + 0 doc-tests，
+  `TEST_RC=0`，0 warning）；`cargo build --release --workspace --locked`
+  `BUILD_RC=0`、**0 warning**；Windows 开发机侧 `cargo check --workspace
+  --tests --target x86_64-unknown-linux-gnu` 通过。
+- `git diff --check` 通过，tracked 文本文件 0 CRLF，全部 Markdown 相对链接
+  0 断链、fenced code block 配对，`bash -n packaging/build-deb.sh` 通过。
+
+**打包与安装**：
+
+- `packaging/build-deb.sh` 产出 `sommelier-rs-r_0.3.7-r_amd64.deb`
+  （约 1.3 MiB），`dpkg-shlibdeps` 解析出
+  `libc6 (>= 2.39)`, `libgbm1 (>= 17.1.0~rc2)`, `libgcc-s1`, `libxkbcommon0`；
+  SHA-256 记录于仓库根目录 `SHA256SUMS`（不随包分发，避免自引用），
+  构建机与回传后的本地文件摘要一致。
+- `sudo dpkg -i` 从 `0.3.6-r` 原位升级成功，postinst 打印全部 5 条指引；
+  `/usr/bin/sommelier-rs-r --version` = `sommelier-rs-r 0.3.7-r`，
+  `dpkg-query` = `0.3.7-r`；包内 8 份 `docs/*.md` + `README.md` + `copyright`
+  与两个 systemd user 模板全部随包分发。
+
+**安装后的端到端回归**（共存 socket `wayland-wbx` / X display `:9`）：
+
+- `sommelier-rs-r-x@wayland-wbx.service` 重启后秒级 `active`；
+  `sommelier@{0,1}`、`sommelier-x@{0,1}` 四个主线单元连同共存单元
+  **5 个全部 `active`**。
+- `wl_drm` / Crostini IME wire 探针：`TOTAL_GLOBALS 25`，
+  `device=/dev/dri/renderD128`、5 个 `format`、`capabilities=1`、
+  `authenticated=True`，两个 IME manager 均可 bind → `RESULT PASS`。
+- Wayland wire 探针：25 个 globals / 15 个 host events，
+  geometry / mode / scale / done / seat capabilities 全 PASS，`errors=0`。
+- X11 `:9` 冒烟：`1920x1280 (508x339mm)`、RandR monitor `406mm x 270mm`、
+  WM 检查窗 `_NET_WM_NAME(UTF8_STRING) = "Sommelier"`、`xmessage` 真实窗口
+  `0x400020` 带 `_NET_FRAME_EXTENTS = 1,1,1,1`、剪贴板往返
+  `wb-e2e-clip-7788` 与 `TARGETS / UTF8_STRING` 全部通过。
+- 主线 `:0` 仍为 `1920x1280 (406x270mm)` / `406mm x 270mm`，几何未变；
+  共存单元近 5 分钟 journal 中无 `ERROR` / `WARN` / `panic` /
+  `glamor ... not supported` 行。`BadWindow` 仅以 `DEBUG` 级别出现为
+  `x11: ignoring BadWindow packet`（窗口退出竞态），这是 `v0.3.6-r` 把
+  `ChangeWindowAttributes` 改 unchecked 后的预期记录，不是告警。
+
+**仍未覆盖**（代码无法自证）：ChromeOS host 侧人工复制粘贴与 IME 输入、
+连续数天的稳定性、真实 GPU 加速路径、注销重登后的长期自启。

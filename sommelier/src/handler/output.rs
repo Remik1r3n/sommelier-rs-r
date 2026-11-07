@@ -587,6 +587,50 @@ mod tests {
         );
     }
 
+    /// Lock in the mainline equivalence of the X11 wire state.
+    ///
+    /// Mainline `sl_calculate_scale_for_xwayland` (sommelier.cc:3507-3549)
+    /// sets `ctx->scale = desired_scale * DSF * preferred_scale` and then
+    /// `sl_output_get_host_output_state` (sommelier-output.cc:106-110) emits
+    /// `width = host_w * ctx->scale / (DSF * current_scale)` with a forced
+    /// integer scale of 1. When `preferred_scale == current_scale` the DSF and
+    /// zoom terms cancel, leaving `host_w * desired_scale`. Our `Transform`
+    /// models DSF separately (in `OutputGeometry`, used for DPI / direct
+    /// mode) and computes `host_to_guest_size = host_w * desired_scale`, so
+    /// the wire result is identical without ever folding DSF into the scale.
+    /// Folding it in here would double-apply DSF and break the verified
+    /// 96 -> 120 DPI two-phase sequence above.
+    #[test]
+    fn xwayland_wire_state_matches_mainline_formula() {
+        // Integral desired scales only: mainline rounds --scale to an integer
+        // before wp_viewporter is detected (sommelier.cc:4408-4411).
+        for desired in [1.0, 2.0, 3.0] {
+            let mut handler = OutputHandler::new();
+            let mut ctx = ctx_for(desired);
+            ctx.is_xwayland_client = true;
+            ctx.shadow_table.map_id(3, 7);
+            ctx.output_extension_to_host.insert(77, 7);
+            ctx.last_sender_id = 7;
+            handler.on_mode(&mut ctx, 1, 1920, 1080, 60000);
+            WlOutputHandler::on_scale(&mut handler, &mut ctx, 2);
+            handler.on_geometry(&mut ctx, 0, 0, 300, 200, 0, "make", "model", 0);
+            ctx.host_to_client_queue.clear();
+
+            ctx.last_sender_id = 77;
+            ZauraOutputHandler::on_device_scale_factor(&mut handler, &mut ctx, 1250);
+
+            // mainline: applied_scale = 1.25 * 1.0, ctx->scale = desired *
+            // 1.25 * 1.0 -> width = 1920 * desired; scale forced to 1.
+            let mode = &ctx.host_to_client_queue[1].0;
+            let width = i32::from_ne_bytes(mode[12..16].try_into().unwrap());
+            let height = i32::from_ne_bytes(mode[16..20].try_into().unwrap());
+            assert_eq!(width, (1920.0 * desired) as i32);
+            assert_eq!(height, (1080.0 * desired) as i32);
+            let scale = &ctx.host_to_client_queue[2].0;
+            assert_eq!(i32::from_ne_bytes(scale[8..12].try_into().unwrap()), 1);
+        }
+    }
+
     #[test]
     fn internal_xdg_output_logical_size_is_consumed_locally() {
         let mut handler = OutputHandler::new();

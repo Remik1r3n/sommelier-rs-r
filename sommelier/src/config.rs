@@ -456,6 +456,15 @@ pub struct Config {
     pub exit_with_child: bool,
     pub sd_notify: bool,
     pub runprog: Vec<String>,
+    /// Resolved `--timing-filename` / `--stats-*` / `--trace-*` settings.
+    /// Mainline routes these to Perfetto; we emit CSV/text logs instead.
+    pub stats: crate::stats::StatsConfig,
+    /// Mainline parent/child plumbing. An explicitly supplied `--peer-pid`
+    /// overrides the `SO_PEERCRED` pid we read from the accepted socket.
+    pub peer_pid: Option<i32>,
+    /// Pre-connected guest fd. Mainline's parent hands an accepted fd to the
+    /// forked worker via `--client-fd`; we serve it as the first client.
+    pub client_fd: Option<i32>,
 }
 
 impl Config {
@@ -688,6 +697,17 @@ impl Config {
             exit_with_child: !args.no_exit_with_child,
             sd_notify: args.sd_notify.is_some(),
             runprog: args.runprog.clone(),
+            stats: crate::stats::StatsConfig {
+                timing_filename: args.timing_filename.clone().map(PathBuf::from),
+                stats_log: args.stats_log.clone().map(PathBuf::from),
+                stats_summary: args.stats_summary.clone().map(PathBuf::from),
+                // Mainline's --stats-timer is in seconds (sommelier.cc:3757).
+                stats_timer_ms: args.stats_timer.unwrap_or(10) as u64 * 1000,
+                trace_filename: args.trace_filename.clone().map(PathBuf::from),
+                trace_system: args.trace_system,
+            },
+            peer_pid: args.peer_pid,
+            client_fd: args.client_fd,
         }
     }
 
@@ -860,6 +880,31 @@ mod tests {
         assert!(cfg.gpu_accel);
         assert!(cfg.sd_notify);
         assert_eq!(cfg.application_id.as_deref(), Some("org.chromium.test"));
+        // These are no longer placeholder-only: --peer-pid overrides the
+        // SO_PEERCRED pid and --client-fd is served as the first connection.
+        assert_eq!(cfg.peer_pid, Some(42));
+        assert_eq!(cfg.client_fd, Some(7));
+    }
+
+    #[test]
+    fn observability_flags_are_resolved() {
+        let cfg = Config::from_args(&args(&[
+            "--timing-filename=/tmp/timing.csv",
+            "--stats-log=/tmp/stats.csv",
+            "--stats-summary=/tmp/summary.txt",
+            "--stats-timer=3",
+            "--trace-filename=/tmp/trace.log",
+            "--trace-system",
+        ]));
+        assert!(cfg.stats.enabled());
+        // Mainline's --stats-timer is in SECONDS (sommelier.cc:3757/:4353).
+        assert_eq!(cfg.stats.stats_timer_ms, 3000);
+        assert_eq!(
+            cfg.stats.timing_filename.as_deref(),
+            Some(std::path::Path::new("/tmp/timing.csv"))
+        );
+        assert!(cfg.stats.trace_system);
+        assert!(!Config::from_args(&args(&[])).stats.enabled());
     }
 
     #[test]
