@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_OUTPUT;
 use crate::protocols::wayland::wl_registry;
 use crate::protocols::wayland::wl_shm;
+use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::REQ_GET_XDG_OUTPUT;
 use crate::state::{Context, HostId};
+use crate::transform::ScalingMode;
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -45,11 +48,13 @@ const MAX_ZAURA_SHELL_VERSION: u32 = 38;
 const MIN_ZAURA_SHELL_VERSION: u32 = 6;
 const MAX_TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
 const MAX_WL_DRM_VERSION: u32 = 2;
-/// Synthetic registry names for globals that have no host counterpart
-/// (`zwp_text_input_manager_v3`, `gtk_shell1`). Host global names are small
-/// integers, so these cannot collide.
+/// Synthetic registry names for globals that have no host counterpart.
+/// Host global names are small integers, so these cannot collide.
 pub const SYNTHETIC_TEXT_INPUT_V3_GLOBAL: u32 = 0x7fff_0000;
 pub const SYNTHETIC_GTK_SHELL1_GLOBAL: u32 = 0x7fff_0001;
+pub const SYNTHETIC_WL_DRM_GLOBAL: u32 = 0x7fff_0002;
+pub const SYNTHETIC_TEXT_INPUT_CROSTINI_MANAGER_GLOBAL: u32 = 0x7fff_0003;
+pub const SYNTHETIC_TEXT_INPUT_X11_GLOBAL: u32 = 0x7fff_0004;
 
 /// Version we advertise to the guest for a host global, mirroring the
 /// `MIN(...)` clamps in mainline's `sl_registry_handler`.
@@ -124,6 +129,9 @@ const INTERNAL_GLOBALS: &[&str] = &[
     // --direct-scale) and never advertises it to guests: the translated
     // wl_output geometry already describes the virtual layout.
     "zxdg_output_manager_v1",
+    // wl_drm is emulated locally from an internal host dmabuf v2 proxy
+    // (compositor/sommelier-drm.cc); never forward a host-provided wl_drm.
+    "wl_drm",
     // Legacy / explicit-sync globals handled by the proxy itself.
     "gtk_shell1",
     "gtk_surface1",
@@ -160,6 +168,37 @@ fn is_advertisable(interface: &str, ctx: &Context) -> bool {
 /// Re-emit a `wl_registry.global` event with a rewritten version. The generic
 /// forward path cannot change payload fields, so mainline-style version
 /// clamps need their own event.
+/// Bind the host-side output extension objects mainline creates in
+/// `sl_bind_host_output` (sommelier-output.cc:653-668). `zaura_output` gives
+/// us the real (possibly fractional) device scale factor; `zxdg_output_v1`
+/// is only needed for `--direct-scale` coordinate conversion.
+fn create_output_extensions(ctx: &mut Context, host_output_id: u32) {
+    if ctx.host_zaura_shell_version >= 6 {
+        if let Some(aura_shell) = ctx.host_zaura_shell_id {
+            let id = ctx.shadow_table.allocate_host_id();
+            ctx.shadow_table
+                .track_host_interface(id, "zaura_output".to_string());
+            ctx.output_extension_to_host.insert(id, host_output_id);
+            let mut b = MessageBuilder::new();
+            b.write_u32(id);
+            b.write_u32(host_output_id);
+            ctx.client_to_host_queue
+                .push((b.build_message(aura_shell, REQ_GET_AURA_OUTPUT), Vec::new()));
+        }
+    }
+    if let Some(manager) = ctx.host_xdg_output_manager_id {
+        let id = ctx.shadow_table.allocate_host_id();
+        ctx.shadow_table
+            .track_host_interface(id, "zxdg_output_v1".to_string());
+        ctx.output_extension_to_host.insert(id, host_output_id);
+        let mut b = MessageBuilder::new();
+        b.write_u32(id);
+        b.write_u32(host_output_id);
+        ctx.client_to_host_queue
+            .push((b.build_message(manager, REQ_GET_XDG_OUTPUT), Vec::new()));
+    }
+}
+
 fn emit_global(ctx: &mut Context, name: u32, interface: &str, version: u32) {
     let registry_guest_id = ctx
         .shadow_table
@@ -256,6 +295,32 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
 
         if interface == "zwp_linux_dmabuf_v1" {
+            // Mainline sommelier.cc:658-678 creates the local wl_drm global
+            // unconditionally (only the guest-visible zwp_linux_dmabuf_v1 is
+            // gated by --enable-linux-dmabuf). It needs create_immed, which
+            // exists since dmabuf v2; bind a separate proxy pinned to v2 so
+            // v4+ format/modifier validation cannot reject implicit buffers.
+            if version >= 2 && ctx.drm_device.is_some() && ctx.host_drm_dmabuf_id.is_none() {
+                let host_id = ctx.shadow_table.allocate_host_id();
+                ctx.shadow_table
+                    .track_host_interface(host_id, "zwp_linux_dmabuf_v1".to_string());
+                ctx.host_drm_dmabuf_id = Some(host_id);
+                let mut b = MessageBuilder::new();
+                b.write_u32(name);
+                b.write_string(interface);
+                b.write_u32(2);
+                b.write_u32(host_id);
+                ctx.client_to_host_queue.push((
+                    b.build_message(ctx.last_sender_id, wl_registry::REQ_BIND as u16),
+                    Vec::new(),
+                ));
+                emit_global(ctx, SYNTHETIC_WL_DRM_GLOBAL, "wl_drm", 2);
+                log::debug!(
+                    "wl_drm v2 emulation enabled (internal dmabuf v2 host_id={})",
+                    host_id
+                );
+            }
+
             if !ctx.gpu_accel {
                 return Action::Drop;
             }
@@ -296,6 +361,21 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 ctx,
                 SYNTHETIC_TEXT_INPUT_V3_GLOBAL,
                 "zwp_text_input_manager_v3",
+                1,
+            );
+            // Mainline sommelier.cc:711-714 creates all three globals
+            // together. The crostini/x11 ones are local to sommelier and
+            // have no host counterpart (sommelier-text-input.cc:641-653).
+            emit_global(
+                ctx,
+                SYNTHETIC_TEXT_INPUT_CROSTINI_MANAGER_GLOBAL,
+                "zcr_text_input_crostini_manager_v1",
+                1,
+            );
+            emit_global(
+                ctx,
+                SYNTHETIC_TEXT_INPUT_X11_GLOBAL,
+                "zcr_text_input_x11_v1",
                 1,
             );
 
@@ -388,6 +468,27 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             }
 
             return Action::Drop;
+        } else if interface == "zxdg_output_manager_v1" {
+            // sommelier.cc:759-775: only --direct-scale needs xdg-output, and
+            // mainline warns that binding it unconditionally breaks Crostini.
+            if ctx.transform.mode == ScalingMode::Direct && ctx.host_xdg_output_manager_id.is_none()
+            {
+                let host_id = ctx.shadow_table.allocate_host_id();
+                ctx.shadow_table
+                    .track_host_interface(host_id, "zxdg_output_manager_v1".to_string());
+                ctx.host_xdg_output_manager_id = Some(host_id);
+                let mut b = MessageBuilder::new();
+                b.write_u32(name);
+                b.write_string(interface);
+                b.write_u32(version.min(3));
+                b.write_u32(host_id);
+                ctx.client_to_host_queue.push((
+                    b.build_message(ctx.last_sender_id, wl_registry::REQ_BIND as u16),
+                    Vec::new(),
+                ));
+                log::debug!("Bound zxdg_output_manager_v1 internally for --direct-scale");
+            }
+            return Action::Drop;
         } else if interface == "wl_shm" {
             let host_id = ctx.shadow_table.allocate_host_id();
             ctx.host_shm_id = Some(host_id);
@@ -441,6 +542,26 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             } else {
                 error!("gtk_shell1 bound but host zaura_shell is missing");
             }
+            return Action::Drop;
+        }
+
+        if matches!(
+            interface.as_str(),
+            "zcr_text_input_crostini_manager_v1" | "zcr_text_input_x11_v1"
+        ) {
+            // Purely local: mainline binds these with a null host proxy.
+            ctx.shadow_table
+                .track_interface(*guest_new_id, interface.clone());
+            return Action::Drop;
+        }
+
+        if interface == "wl_drm" {
+            // Purely local: mainline never binds a host wl_drm. The handler
+            // answers authenticate and turns create_prime_buffer into host
+            // dmabuf v2 requests, so no host object id is needed here.
+            ctx.shadow_table
+                .track_interface(*guest_new_id, "wl_drm".to_string());
+            crate::handler::drm::DrmHandler::send_bind_events(ctx, *guest_new_id);
             return Action::Drop;
         }
 
@@ -500,6 +621,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.client_to_host_queue.push((full_msg, Vec::new()));
         } else {
             error!("Registry not mapped! Guest ID: {}", registry_guest_id);
+        }
+
+        if interface == "wl_output" {
+            create_output_extensions(ctx, host_new_id);
         }
 
         Action::Drop

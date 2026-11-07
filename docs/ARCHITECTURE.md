@@ -206,9 +206,15 @@ sequenceDiagram
 拦截 `wl_output.geometry/mode/scale` 与
 `wp_fractional_scale_v1.preferred_scale`，按虚拟坐标系重写，并把输出布局
 同步回 `Transform` 与 `X11Bridge`（供 RandR 模拟）。
-`zxdg_output_manager_v1` 不向 guest 公布、也不在 host 侧内部 bind，因此
-`zxdg_output_v1.logical_*` handler 保留但不会触发；direct 模式直接用
-`wl_output` 几何换算，见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
+
+`create_output_extensions()` 在 `wl_output` bind 之后内部创建 `zaura_output`，
+消费 `scale` / `connection` / `device_scale_factor`（线值 1/1000）；DSF 到达时
+按主线 display-ready 语义重发一次完整 output state。`--direct-scale` 还会内部
+bind `zxdg_output_manager_v1`，把 `logical_size` / `logical_position` 本地消费
+后喂给 `Transform::axis_factors()`；两者都**不向 guest 公布**，
+`aggregate.rs::INTERNAL_EVENT_EXCEPTIONS` 保证这些内部对象的 host 事件不被聚合层
+提前丢弃。`device_scale_factor` 缺省 1.0（主线 `sommelier-output.cc:649`），
+不再用整数 `wl_output.scale` 兜底。
 
 `--no-support-damage-buffer` 把 `wl_compositor` 钳制到 v3，并把违规
 `damage_buffer` 请求改写成缩放后的 `wl_surface.damage`。

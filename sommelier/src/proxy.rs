@@ -59,6 +59,8 @@ struct SommelierHandler {
     viewport: crate::handler::viewport::ViewportHandler,
     gtk_shell1: crate::handler::gtk_shell::GtkShellHandler,
     gtk_surface1: crate::handler::gtk_shell::GtkSurfaceHandler,
+    drm: crate::handler::drm::DrmHandler,
+    text_input_crostini: crate::handler::text_input_crostini::TextInputCrostiniHandler,
 }
 
 impl SommelierHandler {
@@ -83,6 +85,9 @@ impl SommelierHandler {
             viewport: crate::handler::viewport::ViewportHandler,
             gtk_shell1: crate::handler::gtk_shell::GtkShellHandler::new(),
             gtk_surface1: crate::handler::gtk_shell::GtkSurfaceHandler,
+            drm: crate::handler::drm::DrmHandler,
+            text_input_crostini: crate::handler::text_input_crostini::TextInputCrostiniHandler::new(
+            ),
         }
     }
 }
@@ -127,6 +132,12 @@ impl Client {
         ctx.damage_buffer = cfg.damage_buffer;
         ctx.viewport_resize = cfg.viewport_resize;
         ctx.desired_scale = cfg.desired_scale;
+        // Mainline opens the virtio-gpu render node at startup and publishes
+        // its path through wl_drm.device (sommelier.cc:4488-4517).
+        ctx.drm_device = cfg
+            .force_drm_device
+            .clone()
+            .or_else(crate::handler::drm::find_drm_device);
         // `--force-drm-device` also selects the GBM node used by the local
         // SHM/memfd fallback allocator.
         if let Some(path) = &cfg.force_drm_device {
@@ -784,10 +795,12 @@ fn maybe_update_host_serial(ctx: &mut Context, interface: &str, opcode: u16, pay
         return;
     }
     let carries_serial = match interface {
-        // enter(0) / button(3), enter(0) / key(3), down(0), enter(1)
-        "wl_pointer" => matches!(opcode, 0 | 3),
-        "wl_keyboard" => matches!(opcode, 0 | 3),
-        "wl_touch" => opcode == 0,
+        // wl_pointer.enter/leave/button, wl_keyboard.enter/leave/key/modifiers,
+        // wl_touch.down/up, wl_data_device.enter. This matches the refresh
+        // points in mainline sommelier-seat.cc:153-513.
+        "wl_pointer" => matches!(opcode, 0 | 1 | 3),
+        "wl_keyboard" => matches!(opcode, 0 | 1 | 3 | 4),
+        "wl_touch" => matches!(opcode, 0 | 2),
         "wl_data_device" => opcode == 1,
         _ => false,
     };
@@ -949,8 +962,11 @@ protocols::keyboard_extension_unstable_v1::impl_sommelier_delegates!(SommelierHa
 });
 impl protocols::keyboard_extension_unstable_v1::ProtocolHandler for SommelierHandler {}
 
-// zaura_shell is bound internally; its events must never reach the guest.
-protocols::aura_shell::impl_sommelier_delegates!(SommelierHandler, {});
+// zaura_shell itself is bound internally and its events stay local, but
+// zaura_output carries scale / device-scale-factor data we consume.
+protocols::aura_shell::impl_sommelier_delegates!(SommelierHandler, {
+    zaura_output: output
+});
 impl protocols::aura_shell::ProtocolHandler for SommelierHandler {}
 
 // gtk_shell1 is implemented locally (mainline sommelier-gtk-shell.cc) and is
@@ -960,6 +976,22 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
     gtk_surface1: gtk_surface1
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
+
+// wl_drm and the two Crostini IME interfaces are emulated locally; their
+// requests must not reach the host.
+protocols::drm::impl_sommelier_delegates!(SommelierHandler, { wl_drm: drm });
+impl protocols::drm::ProtocolHandler for SommelierHandler {}
+
+protocols::text_input_crostini_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
+    zcr_text_input_crostini_manager_v1: text_input_crostini,
+    zcr_text_input_crostini_v1: text_input_crostini
+});
+impl protocols::text_input_crostini_unstable_v1::ProtocolHandler for SommelierHandler {}
+
+protocols::text_input_x11_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
+    zcr_text_input_x11_v1: text_input_crostini
+});
+impl protocols::text_input_x11_unstable_v1::ProtocolHandler for SommelierHandler {}
 
 protocols::all::impl_generated_delegates!(SommelierHandler);
 

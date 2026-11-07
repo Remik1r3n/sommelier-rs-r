@@ -106,9 +106,12 @@ INCR property 写的是 **chunk size** 而非总长度（`:2250-2257`）。
 
 ## 4. 已知取舍
 
-- **serial 可能为 0**：`Context::host_serial` 来自真实 host 输入事件。进程刚启动、
-  还未收到任何输入时复制，主线同样会用 `last_serial == 0` 发送；此时会打印一条
-  warning，ChromeOS compositor 若严格校验 serial 可能拒绝这次 `set_selection`。
+- **serial 可能为 0**：`Context::host_serial` 来自真实 host 输入事件（
+  `maybe_update_host_serial()` 覆盖 pointer / keyboard / touch / data_device 的
+  输入 opcode）。进程刚启动、还未收到任何输入时复制，主线同样会用
+  `last_serial == 0` 发送 `set_selection`；`v0.3.6-r` 起这条日志降为 debug，
+  不再打 warning。ChromeOS compositor 若严格校验 serial 仍可能拒绝这一次
+  `set_selection`，下一次输入事件后恢复正常。
 - **X11 owner 会被 WM 接管**：host / Wayland 侧复制时，`claim_clipboard()` 让 WM
   成为 X11 owner（主线 `sl_set_selection` 同款行为）。之后 X11 应用粘贴走 WM，
   WM 用预取或延迟 `SelectionRequest` 从 Wayland 侧取数据；这与主线的绕行方式一致。

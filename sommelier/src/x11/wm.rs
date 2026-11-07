@@ -1089,7 +1089,17 @@ impl WmState {
                     });
                 }
             }
-            Event::Error(e) => warn!("x11: X11 error packet: {:?}", e),
+            Event::Error(e) => {
+                // Mainline's event loop (sommelier.cc:3067-3122) has no case
+                // for X11 error packets at all. A client can destroy a window
+                // between CreateNotify and our ChangeWindowAttributes, so
+                // BadWindow (error code 3) is an expected race, not a fault.
+                if e.error_code == 3 {
+                    debug!("x11: ignoring BadWindow packet: {:?}", e);
+                } else {
+                    warn!("x11: X11 error packet: {:?}", e);
+                }
+            }
             Event::Unknown(_) => {}
             other => debug!("x11: unhandled event: {:?}", other),
         }
@@ -1113,10 +1123,10 @@ impl WmState {
         // for the INCR clipboard handshake.
         let mut aux = ChangeWindowAttributesAux::new();
         aux.event_mask = Some(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY);
-        checked(
-            xproto::change_window_attributes(conn, e.window, &aux),
-            "select client window events",
-        );
+        // sommelier.cc:1013-1015 sends this as an unchecked void request and
+        // drops the cookie. Checking it turns the harmless destroy race above
+        // into a synchronous BadWindow warning.
+        let _ = xproto::change_window_attributes(conn, e.window, &aux);
         if self.shape_enabled {
             checked(
                 shape::select_input(conn, e.window, true),

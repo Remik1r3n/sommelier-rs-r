@@ -26,6 +26,11 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use std::collections::HashSet;
 
+/// Internal-only protocols whose host events we still consume locally.
+/// `zaura_output` is bound on the host for scale / device-scale-factor data;
+/// its events must reach `OutputHandler` instead of being dropped wholesale.
+const INTERNAL_EVENT_EXCEPTIONS: &[&str] = &["zaura_output"];
+
 /// A protocol whose objects are bound **internally** by the proxy and must
 /// never be advertised to, or receive events from, guest clients.
 const INTERNAL_ONLY: &[&str] = &[
@@ -71,6 +76,15 @@ const EXPLICIT_DELEGATES: &[&str] = &[
     // gtk_shell1/gtk_surface1 are guest-only objects translated onto
     // zaura_shell by handler/gtk_shell.rs.
     "gtk",
+    // wl_drm is emulated locally (handler/drm.rs) on top of an internal
+    // host zwp_linux_dmabuf_v1 v2 proxy; the generated forward delegate
+    // would send guest requests to a nonexistent host wl_drm object.
+    "drm",
+    // The two Crostini IME interfaces are pure-local (handler/
+    // text_input_crostini.rs); forwarding them to the host would target a
+    // global Exo does not advertise.
+    "text_input_crostini_unstable_v1",
+    "text_input_x11_unstable_v1",
 ];
 
 fn interfaces(p: &Protocol) -> Vec<&Interface> {
@@ -117,7 +131,7 @@ pub fn generate_aggregate(entries: &[(String, Protocol)]) -> String {
             request_arms.push(quote! {
                 #name => super::#mod_ident::dispatch_request(interface, msg, handler, ctx),
             });
-            if internal {
+            if internal && !INTERNAL_EVENT_EXCEPTIONS.contains(&name) {
                 // Host events for internally-bound objects belong to us, not the
                 // guest. Forwarding them would inject bogus object ids.
                 event_arms.push(quote! { #name => Ok(None), });

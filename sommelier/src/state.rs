@@ -371,6 +371,11 @@ pub struct Context {
     /// virtio-gpu cross-domain backend (crosvm / generic VMM).
     pub virtgpu_channel: Option<Arc<Mutex<VirtGpuChannel>>>,
     pub host_dmabuf_id: Option<u32>,
+    /// Host `zwp_linux_dmabuf_v1` pinned to v2, used only by the local
+    /// `wl_drm` emulation (mainline `sl_host_drm::linux_dmabuf_proxy`).
+    pub host_drm_dmabuf_id: Option<u32>,
+    /// Render-node path handed to Xwayland through `wl_drm.device`.
+    pub drm_device: Option<String>,
     pub host_shm_id: Option<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
@@ -403,6 +408,13 @@ pub struct Context {
     /// Bound version of zaura_shell (capped at 38 in registry). Used to guard
     /// opcodes that require specific protocol versions.
     pub host_zaura_shell_version: u32,
+    /// Host `zxdg_output_manager_v1`, bound internally only with
+    /// `--direct-scale` (sommelier.cc:759-775).
+    pub host_xdg_output_manager_id: Option<u32>,
+    /// Host `zaura_output` / `zxdg_output_v1` ids -> host `wl_output` id.
+    /// These extension objects are internal; their events are consumed by
+    /// `OutputHandler` and never forwarded to the guest.
+    pub output_extension_to_host: HashMap<u32, u32>,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
     /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
@@ -459,6 +471,18 @@ pub struct Context {
 impl Context {
     /// True when `id` belongs to an object we created purely to export the X11
     /// CLIPBOARD selection into the host compositor.
+    /// Look up the host `wl_output` an internal output-extension object
+    /// (`zaura_output` / `zxdg_output_v1`) was created for.
+    pub fn host_output_for_extension(&self, id: u32) -> Option<u32> {
+        self.output_extension_to_host.get(&id).copied()
+    }
+
+    /// Host dmabuf factory events belong to our internal binds, not to a
+    /// guest object. The wl_drm emulation binds a second proxy at v2.
+    pub fn is_internal_dmabuf_id(&self, id: u32) -> bool {
+        self.host_dmabuf_id == Some(id) || self.host_drm_dmabuf_id == Some(id)
+    }
+
     pub fn is_internal_selection_id(&self, id: u32) -> bool {
         self.internal_selection_ids.contains(&id)
             || self.host_data_device_manager_id == Some(id)
@@ -517,6 +541,8 @@ impl Context {
             virtwayland_channel: None,
             virtgpu_channel: None,
             host_dmabuf_id: None,
+            host_drm_dmabuf_id: None,
+            drm_device: None,
             host_shm_id: None,
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
@@ -533,6 +559,8 @@ impl Context {
             viewport_resize: false,
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
+            host_xdg_output_manager_id: None,
+            output_extension_to_host: HashMap::new(),
             vm_identifier: std::env::var("SOMMELIER_VM_IDENTIFIER")
                 .unwrap_or_else(|_| "termina".to_string()),
             wl_surface_to_zaura_surface: HashMap::new(),

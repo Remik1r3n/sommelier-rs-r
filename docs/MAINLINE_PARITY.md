@@ -5,9 +5,11 @@
 167k 行 C++）与本仓库 Rust 实现。行号引用均指主线 C++ 源码。
 
 结论：**CLI/环境变量、global 版本、剪贴板 MIME、X11 启动与 app_id、
-输出几何、INCR 阈值等 30 余处语义偏差已修正**；用户明确要求保留的
-新协议能力、以及少数无法在单进程代理架构下 1:1 复刻的路径，列在
-§3 / §4，属于有意保留，不是遗漏。
+输出几何、INCR 阈值等 30 余处语义偏差已修正**；`v0.3.6-r` 又补齐了
+`wl_drm` v2 本地模拟、两个 Crostini 私有 IME 协议、`zaura_output` /
+`zxdg_output_v1` 内部订阅与 Direct 模式真实 logical size 换算（见 §1.6）。
+用户明确要求保留的新协议能力、以及少数无法在单进程代理架构下 1:1
+复刻的路径，列在 §3 / §4，属于有意保留或有据可查的已知差距，不是遗漏。
 
 后续又在**真实 Crostini 环境**（Debian 13 / `penguin` / `/dev/wl0`）做了
 端到端验证，并据此修掉 3 个只有真机才能暴露的问题，见 §1.5 与 §5。
@@ -52,8 +54,9 @@
 | `zcr_text_input_extension_v1` | `MIN(11, host)` | `:725` | 钳制 |
 | `zwp_text_input_manager_v1` | 固定 1 | `:711` | 固定 |
 | `zaura_shell` | 内部 bind `MIN(38, host)`，guest 侧改发 **`gtk_shell1` v1**（host ≥ 6） | `:629-643` | 见下 |
-| `zxdg_output_manager_v1` | **不向 guest 公布**，仅 `--direct-scale` 时内部 bind | `:759-775` | 从 guest 公告中移除（内部 bind 未复刻，见 §4） |
-| `wl_drm` | host dmabuf ≥ 2 时公布 v2 | `compositor/sommelier-drm.cc:207-217` | 允许 host `wl_drm` 透传并钳制 v2（模拟实现仍未做，见 §4） |
+| `zxdg_output_manager_v1` | **不向 guest 公布**，仅 `--direct-scale` 时内部 bind | `:759-775` | `v0.3.6-r` 从 guest 公告中移除并在 Direct 模式下内部 bind，`logical_*` 本地消费 |
+| `wl_drm` | host dmabuf ≥ 2 时公布 v2，由**本地模拟**实现 | `compositor/sommelier-drm.cc:207-217` | `v0.3.6-r` 本地模拟 v2；host 侧同名 global 列入 `INTERNAL_GLOBALS` 不再透传 |
+| `zcr_text_input_crostini_manager_v1` / `zcr_text_input_x11_v1` | sommelier 本地实现并公布 | `sommelier-text-input.cc:548-697` | `v0.3.6-r` 本地实现并公布 v1 |
 | X11 client | **不公布** `wl_data_device_manager` / `xdg_wm_base`，只内部 bind | `:589-628` | `is_advertisable()` 对 Xwayland 连接过滤 |
 
 补充实现：
@@ -76,6 +79,10 @@
 | `wl_output.scale`（Wayland） | `MIN(ceil(applied_scale/ctx.scale), 2)` | 已一致，保留 |
 | `damage_buffer → damage` | 非 direct 分支 `±1` 外扩、min 角 trunc / max 角 ceil；direct 不外扩 | 已一致，保留 |
 | `--stable-scaling` 负坐标 | `ceil`/`floor`（非 trunc） | 已一致，保留 |
+| `device_scale_factor` 初值 | `1000`（1.0），仅 aura 事件覆盖（`sommelier-output.cc:649`） | 缺省 1.0，不再用 `wl_output.scale` 兜底 |
+| X11 分支的目标 DPI | `DEFACTO_DPI × device_scale_factor`（`:112`） | `physical_size_for_dpi()` 用真实 DSF（真机 1.25 → 120 DPI → 406×270mm） |
+| display-ready 后的 output update | `sl_calculate_scale_for_xwayland` 重发完整 state（`:3541-3548`） | DSF 到达时 `resend_output_state()` 重发 geometry/mode/scale/done |
+| Direct 模式坐标换算 | 内部 xdg-output 的 `logical_size` | 同样内部 bind，优先 `virtual_width / logical_width` |
 
 ### 1.4 X11 / 剪贴板
 
@@ -100,6 +107,18 @@
 | 1 | 继承现役 systemd 环境后直接拒绝启动：`error: invalid value '1' for '--glamor' [possible values: true, false]` | 主线把 `SOMMELIER_GLAMOR` / `SOMMELIER_CLIPBOARD_MANAGER` 当**字符串**（只有 `"0"` 禁用），真机注入的是 `"1"`；Rust 却把 6 个 bool flag 直接绑到 clap 的 `env`，clap 只接受 `true/false`。这会让 Rust 版在标准 Crostini 环境下**完全无法启动** | 去掉 `glamor` / `no_clipboard_manager` / `direct_scale` / `stable_scaling` / `x11` / `virtgpu_channel` 的 clap `env` 绑定，改由 `Config::from_args` 按主线字符串语义读取（`virtgpu_channel` 补上 `env_bool`）；新增 `mainline_string_envs_are_not_bound_to_bool_flags` 回归测试，直接断言这些 flag 不再绑 env |
 | 2 | `-X` 启动 10 秒后 `Xwayland displayfd did not contain a display number`，Xwayland 报 `(EE) could not connect to wayland server`，X11 静默降级 | Xwayland 要先完成 Wayland 握手才往 `-displayfd` 写 display 号；原实现在 `proxy::run()` **之前**同步阻塞等 displayfd，而 Xwayland 的 `WAYLAND_SOCKET` fd 要等 `start_x11()` 返回后才交给 proxy，形成死锁。主线用单个 event loop 同时服务两者，不会死锁 | `main` 提前创建 `WAYLAND_SOCKET` socketpair，`wl_parent` 立即交给 `proxy::run()`（开头即 `spawn_client(..., true)`）；`start_x11(..., wl_child)` 移到独立 OS 线程（runtime 是 `current_thread`，不能阻塞 main task），成功后设置 `DISPLAY` 再启动 `runprog`；`X11Runtime` 不再回传 fd |
 | 3 | 真机 `cargo test` 有 1 个失败：`preferred_scale_matches_mainline_round_wire_over_scale` 期望 180、实际 1800 | `Transform::new(0.0)` 会 clamp 到 `MIN_SCALE=0.1`，进不了 `preferred_scale()` 的退化分支，算出 `180/0.1`。Windows 上只能 `cargo check --tests`（不运行），所以此前从未暴露 | 测试改为直接置 `scale = 0.0` / `NaN` 来覆盖防御分支，并补一条断言 |
+
+### 1.6 v0.3.6-r 补齐的主线能力
+
+| 主线实现 | Rust 新增 | 对齐要点 |
+|---|---|---|
+| `compositor/sommelier-drm.cc`：`wl_drm` v2 本地模拟 | `handler/drm.rs` | `device(string)`、`format` ×5、`authenticated`、`capabilities(PRIME=1)` 全部本地回复；`create_prime_buffer` 转成内部 host `zwp_linux_dmabuf_v1` **v2** proxy 的 `create_params` → `add(fd, MOD_INVALID hi/lo)` → `create_immed` → `destroy`；多平面（offset1/stride1 非零）按主线拒绝。固定 bind v2 以规避 v4/v5 `invalid_format` 规则 |
+| `sommelier-text-input.cc:548-697`：Crostini 私有 IME | `handler/text_input_crostini.rs` | `zcr_text_input_crostini_manager_v1` / `zcr_text_input_crostini_v1` / deprecated `zcr_text_input_x11_v1` 全部本地实现；核心是 XID → host `wl_surface` → host `zwp_text_input_v1.activate`。因 Rust 每 client 一条 host connection，非 Xwayland 连接无法解析 XID，降级为 placeholder `wl_surface`（见 §4） |
+| `sommelier-output.cc:510-548`：`zaura_output` 监听器 | `OutputHandler` 的 `ZauraOutputHandler` | `scale`（CURRENT=0x1 / PREFERRED=0x2，线值 1/1000）、`connection`（INTERNAL=1）、`device_scale_factor` 本地消费；`insets` / `logical_transform` / `release` 按主线 DoNothing |
+| `sommelier.cc:3541-3548` + `:3599-3603`：display-ready 后重发 output state | `resend_output_state()` | DSF 事件（在主线里是 display-ready）到达后重发 geometry / mode / scale / done，主线注释明确说明这是 Xwayland DPI 生效所需的 output update。**保留对 Xwayland 的重发**，未做「X11 不重发」的降级 |
+| `sommelier-output.cc:649`：DSF 初值 1000 | `sync_transform()` | 未收到 aura 事件时缺省 **1.0**，不再用整数 `wl_output.scale`（真机上该值为 2，会算出 192 DPI 的错误首帧） |
+| `sommelier.cc:759-775`：direct 模式内部 bind xdg-output | `create_output_extensions()` + `Transform::axis_factors()` | Direct 模式优先用 `virtual_width / logical_width`，无 xdg 数据时回退 `scale × DSF` |
+| `sommelier.cc:3522` 的 serial 采集、`sl_set_selection` 的 unchecked 请求 | `proxy.rs` / `x11/wm.rs` / `x11/selection.rs` | 扩充 pointer/keyboard/touch/data_device 的 serial opcode；`ChangeWindowAttributes` 改 unchecked 并对 `BadWindow` 降到 debug；`host_serial == 0` 不再告警（主线初值同为 0 且照常发 `set_selection`） |
 
 ---
 
@@ -138,21 +157,22 @@
 
 ## 4. 仍未 1:1 对齐的项目（如实列出）
 
+`v0.3.6-r` 已把 §4 中的 `wl_drm` 本地模拟、Crostini IME 协议、
+`zaura_output` / `zxdg_output_v1` 内部订阅、`host_serial == 0` 告警与
+`BadWindow` 竞态 5 类差距补齐（见 §1.6）。以下为**复查后仍然成立**的差距。
+
 | 项 | 主线 | Rust 现状 | 原因 |
 |---|---|---|---|
-| `wl_drm` 本地模拟 | 从 host `zwp_linux_dmabuf_v1` v2 模拟出 `wl_drm` v2（含 `authenticate`/`create_prime_buffer`） | 仅当 host 自己公布 `wl_drm` 时透传 | 需要 DRM render node + GBM 句柄与 host 认证交互，在 virtio_wl 后端不可靠。**真机已观测到后果**：Xwayland 打印 `glamor: 'wl_drm' not supported` / `Failed to initialize glamor, falling back to sw`，即硬件加速路径退化为软件渲染；2D 功能不受影响 |
-| `sl_calculate_scale_for_xwayland` | Xwayland ready 后按 `device_scale_factor × preferred_scale` 重算 `ctx.scale`（`:3507-3549`） | 只实现了 `wp_viewporter` 出现时应用 `desired_scale` | 需要 host `zaura_output` 的 scale/DSF 事件；目前只有 `wl_output.scale` |
+| **X11 screen DPI** | `:0` 的 `xdpyinfo` 为 `1920x1280 (406x270mm)` / 120 DPI | `:9` 的 `xrandr` monitor 已是主线同款 `406x270mm`，但 `xdpyinfo` X screen 仍为 `508x339mm` / 96 DPI | Xwayland `update_screen_size()` 用 `width × 25.4 / monitorResolution` 计算 screen mm，该值在 X server 启动时固定。真机三项实验均证明代理侧无法改变：① 让首帧即以 DSF=1.25 发 geometry；② Xwayland 启动加 `-dpi 120`；③ 运行时 `xrandr --dpi 120` / `--fb --dpi`。根因是本项目的**每 guest client 独立 host 连接**：host 输出握手晚于 Xwayland 初始化，主线共享 host display 则在启动 Xwayland 前已完成。影响仅限读取 `Xft.dpi` 的老式 X11 应用 |
+| `sl_calculate_scale_for_xwayland` 的完整重算 | Xwayland ready 后 `ctx.scale = desired_scale × DSF × preferred_scale`，并 round/clamp（`:3507-3549`） | 已消费 `scale` / `preferred_scale` / DSF 并重发 output state，但未把三者完整乘回 `ctx.scale` | 需要把 internal output 的 `preferred_scale` 与 DSF 一并注入 `Transform`；当前 `wp_viewporter` 分支只应用 `desired_scale` |
 | `wl_output.mode` 宽高公式 | `host_w × ctx.scale × s / applied_scale`（含 aura_shell 的 `applied_scale`） | `trunc(host_w × ctx.scale)` | 两者算出的**逻辑尺寸**一致（Rust 用整数 `wl_output.scale` 承载差值），但 wire 上的 size/scale 数值不同 |
-| `--direct-scale` 时的 `zxdg_output_manager_v1` 内部 bind | 内部 bind 并向每个 output 取 `logical_size` / `logical_position`，用于 direct 模式的坐标换算（`:759-775`） | 不公布也不 bind；`zxdg_output_v1` 事件 handler 保留但不会被触发 | Rust 的 direct 模式直接用 `wl_output` 几何 + `Transform` 换算，不依赖 xdg-output；guest 侧行为一致，但未复刻该 host 侧数据来源 |
+| Crostini IME 的 XID → surface 解析 | 共享 host display，可直接找到 Xwayland 的 host `wl_surface` | 非 Xwayland 连接走内部创建的 placeholder `wl_surface` | 每 client 独立 host connection 导致 XID 关联表不在同一连接上；真实 ChromeOS host 侧人工 IME 输入尚未验证 |
 | `--viewport-resize` | 在 surface commit 时用 `window->viewport_width/height` 覆盖 host viewport destination | 在 guest `wp_viewport.set_destination` 上按 scale 换算 | 实现路径不同，效果接近；未复刻 `viewport_pointer_scale` 指针补偿 |
-| `zcr_text_input_crostini_manager_v1` / `zcr_text_input_x11_v1` | 由 sommelier 本地实现并公布 | 未公布 | 纯 guest 侧 IME 协议，需要完整实现才能安全公布；v3 路径已覆盖现代客户端 |
 | `zaura_shell` → `zwp_tablet_manager_v2`（stylus） | stylus-v2 协议转换 | 透传 tablet-v2 | 主线做的是协议转换，Rust 保留直接透传 |
 | `--peer-pid` / `--client-fd` / `--peer-cmd-prefix` | parent/child 进程间 fd 传递 | 只解析、不实现 | 与单进程架构不兼容；接受参数避免上游命令行启动失败 |
 | `--timing-filename` / `--stats-*` / `--trace-*` | Perfetto / 帧统计 | 只解析、不实现 | 可观测性功能，不影响协议兼容 |
 | INCR 接收侧缓冲策略 | 必须先缓冲 64 KiB 再决定 one-shot / INCR（`:2219-2235`） | 采用预取缓存 + 按需 ConvertSelection | 阈值与 chunk 已对齐，驱动方式不同 |
-| `host_serial == 0` 的首次导出 | 使用真实 seat serial | 启动初期可能为 0 | 需在 guest 内首次输入事件后才有有效 serial |
-| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**（见 §5），Wayland 与 X11 两条主链路均打通 | 仍未覆盖：ChromeOS **host 侧**粘贴/复制的人工确认、`--peer-pid`/`--client-fd` 的 parent/child fork 模型替换现役实例、长时间稳定性与真实 GPU 加速 |
-| WM 的 `BadWindow` 竞态 | 主线对已销毁窗口的操作静默忽略 | 真机日志出现 2 次 `select client window events failed: X11Error { error_kind: Window, ... ChangeWindowAttributes }`（`xmessage` 退出时窗口已销毁） | 无害竞态，X11 会话其余功能正常；未改 |
+| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**（见 §5），Wayland 与 X11 两条主链路均打通，`wl_drm` / IME wire 探针 PASS | 仍未覆盖：ChromeOS **host 侧**粘贴/复制与 IME 的人工确认、`--peer-pid`/`--client-fd` 的 parent/child fork 模型替换现役实例、长时间稳定性与真实 GPU 加速 |
 
 ---
 
@@ -272,3 +292,45 @@
 
 §5.4 表格第 1 项的 CRLF 兼容补丁已随之移除：历史 CRLF 文件统一为 LF，
 并用 `.gitattributes` 固定，`build-deb.sh` 恢复严格版本匹配。
+
+### 5.6 v0.3.6-r 功能补齐与回归验证
+
+SSH 开发机重启后重新连通（同一台 `penguin`），以下结果均在该真机上取得。
+测试仍使用独立 `--socket=wayland-wbx` / `--x-display=9`，现役
+`wayland-0/1`、`:0/:1` 未受影响。
+
+- `cargo fmt --all -- --check` 通过；`cargo test --workspace --locked`
+  **154 个测试全绿**（150 + 4 + 0 doc-tests）；`cargo build --release --locked`
+  **0 warning**。Windows 开发机侧 `cargo check --workspace --tests
+  --target x86_64-unknown-linux-gnu` 同样通过。
+- `packaging/build-deb.sh` 产出
+  `sommelier-rs-r_0.3.6-r_amd64.deb`（约 1.3 MiB），`sudo dpkg -i` 安装后
+  `sommelier-rs-r --version` = `0.3.6-r`。
+- **新增 wire 探针**（纯 Python、无 toolkit 依赖）连到 guest socket：
+  `TOTAL_GLOBALS 25`；`wl_drm` v2 可 bind 且依次收到
+  `device=/dev/dri/renderD128`、5 个 `format`、`capabilities=1`、
+  `authenticated=1`；`zcr_text_input_crostini_manager_v1` 与
+  `zcr_text_input_x11_v1` 均可 bind；全程无 `wl_display.error` →
+  `IME_BINDS_OK True` / `RESULT PASS`。
+- **X11 链路**：`sommelier-rs-r-x@wayland-wbx.service` 秒级 `active`；
+  `Xwayland :9` 命令行不再带 `-shm`；新启动日志中
+  `glamor: 'wl_drm' not supported` 与 `falling back to sw` 均已消失；
+  WM 初始化、真实窗口映射到 host `xdg_toplevel`、剪贴板往返
+  `readback=wb-e2e-clip-7788` / `TARGETS` = `TARGETS` + `UTF8_STRING` 保持通过。
+- **`wl_drm` 真实调用**：不只是 probe 能 bind —— 真机 Xwayland 每次映射
+  `xmessage` 窗口都会走 `wl_drm.create_prime_buffer 202x62
+  fmt=0x34325258 stride=808 -> host buffer NN`，即本地模拟的 PRIME 路径
+  确实被 glamor 用来分配窗口缓冲，而非回退软件渲染。
+- 最终 `.deb` 安装后按 §11 的排查表逐项扫描，legacy 错误关键字
+  （`not supported` / `falling back to sw` / `select client window events failed`
+  / `set_selection` serial warning）命中数 **0**；现役 4 个主线单元
+  `sommelier@0/1`、`sommelier-x@0/1` 仍全部 `active`，`:0/:1` 几何未变。
+- **输出 / DPI**：host 确实下发 `zaura_output.device_scale_factor=1250`
+  （→ 1.25），`resend_output_state()` 按 120 DPI 算出 `406x270mm`；
+  `xrandr` :9 显示 `XWAYLAND0 ... 406mm x 270mm`，与主线 `:0` 完全一致。
+  `xdpyinfo` :9 仍为 `508x339mm` / 96 DPI，见 §4 首行：这是 Xwayland
+  启动期 `monitorResolution` 决定的 X screen 值，三项真机实验证明代理侧
+  无法改变，已如实记录为已知差距。
+- 日志洁净度：不再出现 `BadWindow` 的 `select client window events failed`
+  warning（改 unchecked + debug 降级），也不再出现 `host_serial == 0`
+  的 `set_selection` warning（与主线一致，降为 debug）。

@@ -83,6 +83,9 @@ pub struct OutputGeometry {
     pub transform: i32,
     pub host_scale: f64,
     pub device_scale_factor: f64,
+    /// From zxdg_output_v1.logical_size (0 = not received yet).
+    pub logical_width: i32,
+    pub logical_height: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -295,7 +298,26 @@ impl Transform {
                     }
                 })
                 .unwrap_or(1.0);
-            (self.scale * dsf, self.scale * dsf)
+            // Mainline sl_output_init_dimensions_direct (sommelier-output.cc:
+            // 226-229) uses virtual_width / logical_width. Without a real
+            // zxdg_output_v1 event we fall back to scale * DSF.
+            let precise = self.outputs.first().and_then(|o| {
+                if o.logical_width > 0 {
+                    let virtual_width = o.physical_width as f64 * self.scale;
+                    let x = virtual_width / o.logical_width as f64;
+                    let virtual_height = o.physical_height as f64 * self.scale;
+                    let y = if o.logical_height > 0 {
+                        virtual_height / o.logical_height as f64
+                    } else {
+                        x
+                    };
+                    if x.is_finite() && x > 0.0 && y.is_finite() && y > 0.0 {
+                        return Some((x, y));
+                    }
+                }
+                None
+            });
+            precise.unwrap_or((self.scale * dsf, self.scale * dsf))
         } else {
             (self.scale, self.scale)
         }
@@ -648,8 +670,8 @@ impl Transform {
 // ---------------------------------------------------------------------------
 // 对主线语义做的简化（详见最终报告）
 // ---------------------------------------------------------------------------
-// * Direct 模式的 per-output xdg logical size 由 device_scale_factor 近似推导
-//   （virtual/logical = scale * DSF），因为没有 xdg_output 事件输入。
+// * Direct 模式优先用内部绑定的 zxdg_output_v1.logical_size 精确换算
+//   （virtual/logical），host 未提供该事件时回退 scale * DSF 近似。
 // * host 位置匹配使用 physical_width/height 作为矩形尺寸（主线混用 logical
 //   的 x/y 与 mode 的 physical 宽高，此处保持一致）。
 // * damage 的 buffer contents_scale 固定为 1.0（API 未暴露该参数）。
@@ -674,12 +696,37 @@ mod tests {
             transform: 0,
             host_scale: 1.0,
             device_scale_factor: 1.0,
+            logical_width: 0,
+            logical_height: 0,
         }
     }
 
     /// wl_fixed_from_double 的测试辅助。
     fn fx(v: f64) -> i32 {
         (v * WL_FIXED_ONE as f64).round() as i32
+    }
+
+    #[test]
+    fn direct_scale_uses_real_xdg_logical_size() {
+        let mut t = Transform::new(1.0, ScalingMode::Direct, vec![]);
+        let mut o = out(0, 0, 1920, 1080);
+        o.logical_width = 1536;
+        o.logical_height = 864;
+        t.set_outputs(vec![o]);
+        let (x, y) = t.axis_factors();
+        assert!((x - 1.25).abs() < 1e-9, "x factor was {x}");
+        assert!((y - 1.25).abs() < 1e-9, "y factor was {y}");
+    }
+
+    #[test]
+    fn direct_scale_falls_back_without_xdg_logical_size() {
+        let mut t = Transform::new(2.0, ScalingMode::Direct, vec![]);
+        let mut o = out(0, 0, 1920, 1080);
+        o.device_scale_factor = 1.25;
+        t.set_outputs(vec![o]);
+        let (x, y) = t.axis_factors();
+        assert!((x - 2.5).abs() < 1e-9, "x factor was {x}");
+        assert!((y - 2.5).abs() < 1e-9, "y factor was {y}");
     }
 
     #[test]

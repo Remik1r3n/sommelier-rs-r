@@ -466,15 +466,9 @@ impl SelectionBridge {
             return;
         }
         self.exported_targets_generation = generation;
-        if ctx.host_serial == 0 {
-            // Mainline also starts with last_serial == 0 and still sends the
-            // request; most compositors accept it. Surface the condition
-            // instead of silently dropping the clipboard export.
-            log::warn!(
-                "x11: exporting CLIPBOARD without an input serial; \
-                 host compositor may reject wl_data_device.set_selection"
-            );
-        }
+        // Mainline's seat->last_serial also starts at 0 (sommelier.cc:563)
+        // and is passed through unchanged, so this is not an error state.
+        log::debug!("x11: exporting CLIPBOARD with serial {}", ctx.host_serial);
         ensure_host_selection_device(ctx);
         let Some(device) = ctx.host_selection_device_id else {
             return;

@@ -64,7 +64,7 @@ ChromeOS 专有扩展等）。
 [`docs/CROSTINI_INSTALL.md`](docs/CROSTINI_INSTALL.md)）：
 
 ```bash
-sudo dpkg -i sommelier-rs-r_0.3.5-r_amd64.deb
+sudo dpkg -i sommelier-rs-r_0.3.6-r_amd64.deb
 sommelier-rs-r --transport=virtwl --virtio-wl /dev/wl0 --socket=wayland-wb
 WAYLAND_DISPLAY=wayland-wb your-app          # 另一个终端
 ```
@@ -177,14 +177,25 @@ docs/                  当前架构、安装指南、功能矩阵、剪贴板对
    窗口、剪贴板往返均实测），但「X11 复制 → 在 ChromeOS 界面里粘贴」仍需
    人工在 host 侧确认；`--peer-pid`/`--client-fd` 顶替现役实例、长时间稳定性
    与真实 GPU 加速路径也未覆盖。详见 `docs/MAINLINE_PARITY.md` §4 / §5。
-2. **与主线仍有实现路径差距**：`wl_drm` 只透传、不本地模拟（真机 Xwayland
-   的 glamor 因此回退软件渲染）、`--viewport-resize` 未复刻指针补偿、
-   explicit fence / seccomp / `--parent` fork 模型仍是参数或语义级简化。
-   见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §4 与
+2. **与主线仍有实现路径差距**：`wl_drm` 本地模拟、`zcr_text_input_crostini_v1` /
+   `zcr_text_input_x11_v1`、`zaura_output` / `zxdg_output_v1` 内部订阅已在
+   `v0.3.6-r` 补齐；仍存在差距的是 `--viewport-resize` 的指针补偿、
+   `wl_output.mode` 的 wire 数值公式、X11 屏幕 DPI（见下）、explicit fence /
+   seccomp / `--parent` fork 模型。见
+   [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §4 与
    [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md) §6。
-3. **首次复制可能缺 serial**：`wl_data_device.set_selection` 的 serial 取自
+3. **X11 屏幕 DPI 与主线 :0 不同**：`xrandr` 的 RandR monitor 物理尺寸已与主线
+   一致（`406x270mm` / 120 DPI），但 `xdpyinfo` 的 X screen 仍为
+   `508x339mm` / 96 DPI。该值由 Xwayland 启动时的 `monitorResolution` 决定，
+   真机实测 seeding DSF、`-dpi 120`、`xrandr --dpi 120` 三种方式均无法从代理
+   侧改变；根因是本项目「每 guest client 独立 host 连接」的架构使 host 输出
+   状态晚于 Xwayland 初始化就绪，而主线共享 host display 在启动 Xwayland 前
+   已完成输出握手。受影响的只是读取 `Xft.dpi` 的老式 X11 应用。详见
+   [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §4。
+4. **首次复制可能缺 serial**：`wl_data_device.set_selection` 的 serial 取自
    host 输入事件；进程刚启动尚未收到输入时为 0（主线 `last_serial` 初值同样
-   为 0），此时会打 warning，个别严格校验的 compositor 可能拒绝这一次导出。
+   为 0，且照常发送 `set_selection`，`v0.3.6-r` 起不再打 warning）。个别严格
+   校验 serial 的 compositor 可能拒绝这一次导出。
 
 ## 版本里程碑
 
@@ -197,6 +208,7 @@ docs/                  当前架构、安装指南、功能矩阵、剪贴板对
 | `v0.3.3-r` | **真实 Crostini 端到端验证**并修复 3 个真机特有问题：字符串 `SOMMELIER_*` env 绑定 bool flag 导致拒绝启动、X11 启动顺序死锁（Xwayland 连不上 Wayland proxy）、一个仅在运行时暴露的测试断言错误。Wayland 与 X11 两条主链路实测打通。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §1.5 / §5 |
 | `v0.3.4-r` | **Debian `.deb` 交付与 Crostini 安装指南**：`packaging/build-deb.sh`（release + strip + `dpkg-shlibdeps` 自动解析依赖 + 两个 systemd user 模板 + 全量文档），`docs/CROSTINI_INSTALL.md` 覆盖安装、与主线共存、Wayland/X11/systemd 三种启动、参数速查、故障排查与卸载；`.deb` 已实机 `dpkg -i` 安装、两个 systemd 单元实测通过。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §5.4 |
 | `v0.3.5-r` | **历史包袱清理**（无功能变更）：删除死文件、未用依赖与零调用符号，移除半接线的停机分支，统一 CRLF→LF 并去掉打包脚本的行尾兼容补丁，精简合并期过程文档、修正过时表述，release workflow 改为产出 `.deb`。主线 CLI 兼容面与三套 transport 保持不变 |
+| `v0.3.6-r` | **继续补齐主线缺失能力**：本地模拟 `wl_drm` v2（`device`/`format`/`authenticated`/`capabilities`/`create_prime_buffer` → host dmabuf v2），真机 Xwayland 不再打印 `glamor: 'wl_drm' not supported` / `falling back to sw`；新增 `zcr_text_input_crostini_manager_v1` / `zcr_text_input_crostini_v1` / `zcr_text_input_x11_v1` 本地 IME 协议；内部订阅 `zaura_output`（scale / connection / device_scale_factor）与 `--direct-scale` 下的 `zxdg_output_v1`，Direct 模式改用真实 logical size，DSF 缺省值与主线一致（1.0）；`BadWindow` 改用 unchecked 请求、`host_serial == 0` 不再告警、扩展输入 serial 采集。真机 154 个测试全绿、release 0 warning、wire 探针 25 globals / `wl_drm` + IME 全部 PASS。详见 [`docs/MAINLINE_PARITY.md`](docs/MAINLINE_PARITY.md) §5.6 |
 
 ## 其他说明
 

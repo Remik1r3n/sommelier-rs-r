@@ -56,7 +56,10 @@
 | `--dpi` 桶与 physical mm 换算 | ✅ | `transform.rs::physical_size_for_dpi` |
 | `wl_fixed` 24.8 定点变换（无 f32 精度损失） | ✅ | `transform.rs::fixed_mul_frac` |
 | `wl_output.geometry/mode/scale/name/description/done` 改写 | ✅ | `handler/output.rs`（本次接入运行时） |
-| `zxdg_output_v1.logical_*` handler | ⚠️ | `zxdg_output_manager_v1` **不向 guest 公布、也不在 host 侧内部 bind**；handler 保留但不会触发。direct 模式用 `wl_output` 几何 + `Transform` 换算，见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4 |
+| `zxdg_output_v1.logical_*` 内部订阅 | ✅ | `--direct-scale` 时内部 bind `zxdg_output_manager_v1`，`logical_size` / `logical_position` 本地消费并喂给 `Transform`，**不向 guest 公布**（与主线 `sommelier.cc:759-775` 一致）；`handler/output.rs::create_output_extensions` |
+| `zaura_output` 内部订阅 | ✅ | `scale`（CURRENT/PREFERRED）、`connection`（INTERNAL）、`device_scale_factor` 本地消费；DSF 到达后按主线 `sl_calculate_scale_for_xwayland` 的语义重发一次完整 output state。`handler/output.rs` |
+| Direct 模式精确 logical size 换算 | ✅ | `Transform::axis_factors()` 优先用 `virtual_width / logical_width`，无 xdg-output 数据时回退 `scale × DSF`；`transform.rs` 含正反两组单测 |
+| DSF 缺省值与主线一致 | ✅ | 主线 `sl_create_host_output` 把 `device_scale_factor` 初始化为 1000（1.0），仅在 aura 事件到达后覆盖；Rust 同样缺省 1.0，不再拿整数 `wl_output.scale` 兜底 |
 | `wp_fractional_scale_v1.preferred_scale` 改写 | ✅ | `handler/output.rs` |
 | 多输出布局、按位置推断输出、虚拟桌面尺寸 | ✅ | `transform.rs::set_outputs` / `virtual_dimensions` |
 | per-surface `wp_viewport` 缩放（非可缩放窗口） | ✅ | `handler/viewport.rs`：`--viewport-resize` 时把 `set_destination` 用 `Transform::viewport_scale` 换算后重写 host 请求；`-1/-1` 直通。已可用，但未复刻主线 `viewport_pointer_scale` 指针补偿（见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4） |
@@ -72,7 +75,8 @@
 | `zcr_keyboard_extension_v1` / `zcr_extended_keyboard_v1` 系统快捷键 ack-key | ✅ |
 | `SOMMELIER_ACCELERATORS` / `SOMMELIER_WINDOWED_ACCELERATORS` 过滤 | ✅ `accelerator.rs` |
 | `zwp_text_input_v1` + `zcr_text_input_extension_v1` ↔ guest `zwp_text_input_v3` | ✅ 同时公布主线 v1（透明转发到 host，固定 v1）与 v3（映射到内部 host v1 manager）；extension 按主线 `MIN(host,11)` 公布。`handler/text_input.rs` |
-| `zcr_text_input_crostini_v1` / `zcr_text_input_x11_v1` | ⚠️ 协议 XML 与生成代码就绪，无手写 handler |
+| `zcr_text_input_crostini_manager_v1` / `zcr_text_input_crostini_v1` / `zcr_text_input_x11_v1` | ✅ `handler/text_input_crostini.rs`：本地实现（不转发 host），XID → host `wl_surface` → host `zwp_text_input_v1.activate`；deprecated x11 协议同样可 bind。因每 client 独立 host connection，非 Xwayland 连接使用 placeholder surface 降级 |
+| `wl_drm` v2 本地模拟 | ✅ `handler/drm.rs`：探测 `/dev/dri/renderD*`，本地回复 `device` / 5 个 `format` / `capabilities(PRIME)` / `authenticated`；`create_prime_buffer` 转换成内部 host `zwp_linux_dmabuf_v1` **v2** proxy 的 `create_params` → `add(fd, MOD_INVALID hi/lo)` → `create_immed` → `destroy`。host 侧 `wl_drm` 列入 `INTERNAL_GLOBALS` 避免二次发布 |
 | gaming input / stylus / tablet 扩展 | ✅ 纯转发 |
 | `zwp_linux_dmabuf_v1` + GBM / explicit fence | ⚠️ 协议与 GBM 分配可用，`--explicit-fence` 未接入 fence 逻辑 |
 
@@ -94,7 +98,8 @@
 | 聚合 `dispatch_request` / `dispatch_event` / `impl_generated_delegates!` | ✅ | `wayland_codegen/src/aggregate.rs` |
 | `&str` handler 参数（非 `&String`） | ✅ | codegen 与全部手写 handler 统一使用 `&str` |
 | 内部绑定协议的 host event 隔离 | ✅ | `aggregate.rs::INTERNAL_ONLY` 覆盖 10 个纯内部模块；text-input v1 / extension 因需要转 v3 事件而有意保留转发 |
-| 主线式 global 版本钳制 | ✅ | `advertised_version()` / `host_bind_version()`：compositor 4/3、output ≤3、seat ≤5、data_device_manager ≤3、xdg_wm_base ≤3、dmabuf ≤4、text-input-extension ≤11、wl_drm ≤2。`wl_drm` 仅透传并钳制版本，本地模拟未实现，见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4 |
+| 主线式 global 版本钳制 | ✅ | `advertised_version()` / `host_bind_version()`：compositor 4/3、output ≤3、seat ≤5、data_device_manager ≤3、xdg_wm_base ≤3、dmabuf ≤4、text-input-extension ≤11、wl_drm ≤2。`wl_drm` v2 为本地模拟（见 §4），内部 dmabuf proxy 固定 bind **v2** 以规避 v4/v5 的 `invalid_format` 规则 |
+| synthetic global 与内部事件例外 | ✅ | `registry.rs` 发布 `wl_drm` / crostini IME / x11 IME；`aggregate.rs::INTERNAL_EVENT_EXCEPTIONS` 让内部 `zaura_output` 的 host 事件仍能被手写 handler 消费，而不是在聚合层被丢弃 |
 | `damage_buffer` → `damage` 改写 | ✅ | `handler/compositor.rs`，含 2 个单测 |
 | quirks textproto-like 规则（steam_game_id / always / enable / disable / merge） | ✅ | `quirks.rs`；不引入 protobuf，多 condition 整条跳过 |
 | 主线 CLI + `SOMMELIER_*` 环境变量 | ✅ | `config.rs`，12 个配置单测；`--socket`/`--display`/位置参数语义与主线一致。逐项对照见 [`docs/MAINLINE_PARITY.md`](MAINLINE_PARITY.md) |
@@ -115,9 +120,12 @@
 `wayland`, `xdg-activation-v1`, `xdg-decoration-unstable-v1`,
 `xdg-dialog-v1`, `xdg-output-unstable-v1`, `xdg-shell`。
 
-其中 12 个协议有手写 delegation（见 `proxy.rs`），其余由聚合宏生成纯转发实现；
+其中 16 个协议有手写 delegation（见 `proxy.rs`），其余由聚合宏生成纯转发实现；
 `aggregate.rs::INTERNAL_ONLY` 列出 10 个纯内部绑定模块，其 host event 在聚合
-分发层直接丢弃，避免把 host 对象 id 注入 guest。
+分发层直接丢弃，避免把 host 对象 id 注入 guest。唯一的例外是
+`INTERNAL_EVENT_EXCEPTIONS = ["zaura_output"]`：它虽属内部绑定协议，但
+`device_scale_factor` / `scale` / `connection` 事件必须交给 `OutputHandler`
+本地消费，否则输出 DPI 与缩放修正无法生效。
 
 ## 6. 已知限制（按影响排序）
 
@@ -137,10 +145,22 @@
    获取，1.5 s 内未取到会按 ICCCM 回复 property NONE。X11 → host / guest
    Wayland 方向不受此限制（`ConvertSelection` 直接回写 fd）。
 5. **`wl_data_device.set_selection` 的 serial 可能为 0**：`Context::host_serial`
-   由 host 输入事件提取；进程刚启动尚未收到输入时复制，会带 serial 0 发送并
-   打印 warning（主线 `last_serial` 初值同样为 0）。若 ChromeOS compositor
-   严格校验 serial，这一次导出可能被拒绝，下一次输入事件后恢复正常。
-6. **`current_thread` Tokio runtime 是硬约束**：`KeyboardHandler` 中的
+   由 host 输入事件提取；进程刚启动尚未收到输入时复制，会带 serial 0 发送
+   （主线 `seat->last_serial` 初值同样为 0 且照常发送，`v0.3.6-r` 起不再打印
+   warning，并扩展了 pointer / keyboard / touch / data_device 的 serial 采集
+   opcode）。若 ChromeOS compositor 严格校验 serial，这一次导出可能被拒绝，
+   下一次输入事件后恢复正常。
+6. **X11 screen DPI 与主线 :0 不同**：`xrandr` 的 RandR monitor 已是主线同款
+   `1920x1280 / 406x270mm`（120 DPI），但 `xdpyinfo` 的 X screen 仍为
+   `508x339mm`（96 DPI）。Xwayland 的 `update_screen_size()` 用
+   `width * 25.4 / monitorResolution` 计算 screen mm，该值在 X server 启动时
+   固定；真机实测 seeding DSF、`-dpi 120` 启动参数、`xrandr --dpi 120` 三种
+   方式均无法从代理侧改变。根因是本项目每个 guest client 独立建立 host 连接，
+   host 输出状态晚于 Xwayland 初始化；主线共享 host display 在启动 Xwayland
+   前已完成输出握手。影响范围仅限读取 `Xft.dpi` 的老式 X11 应用，Wayland
+   客户端与 RandR 几何不受影响。详见
+   [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
+7. **`current_thread` Tokio runtime 是硬约束**：`KeyboardHandler` 中的
    `xkbcommon` 对象 `!Send`，依赖 `unsafe impl Send`；任何改为多线程 runtime
    的尝试都会破坏该不变量。剪贴板的管道读写也因此用 `tokio::fs` 的
    blocking pool 完成，不占 runtime 线程。
@@ -152,7 +172,7 @@
 | `cargo check --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | build script 生成 | ✅ 33 个协议模块 + 1 个聚合模块（34 个 include） |
-| 单元测试 | **143 个 `#[test]` 在真实 Crostini（Debian 13 / `penguin`）上全部运行通过**（139 + 4 + 0 doc-tests）；本轮新增 env/bool 绑定回归测试，并修正 `preferred_scale` 退化分支测试 |
+| 单元测试 | **154 个 `#[test]` 在真实 Crostini（Debian 13 / `penguin`）上全部运行通过**（150 + 4 + 0 doc-tests）；`v0.3.6-r` 新增 `wl_drm` 本地事件/PRIME 转换、crostini IME、DSF 修正 DPI 与 output state 重发、内部 xdg logical size、Direct 模式真实 logical size 等测试 |
 | CLI 参数解析 | ✅ 用独立 clap crate 在 Windows 本机**实跑** 6 组形状验证全部通过：`--socket` vs `--display`、位置参数 runprog、`--` 分隔、`--sd-notify` 不吃位置参数、全量主线 flag 拼写、`--help`/`--version` |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |

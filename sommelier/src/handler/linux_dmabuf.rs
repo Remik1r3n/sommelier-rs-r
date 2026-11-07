@@ -94,15 +94,9 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     fn on_format(&mut self, ctx: &mut Context, format: u32) -> Action {
         ctx.supported_formats.insert(format);
 
-        if let Some(internal_id) = ctx.host_dmabuf_id {
-            if ctx.last_sender_id == internal_id {
-                return Action::Drop;
-            }
+        if ctx.is_internal_dmabuf_id(ctx.last_sender_id) {
+            return Action::Drop;
         }
-
-        // if format == 0x34324241 || format == 0x34324258 {
-        //     return Action::Drop;
-        // }
 
         Action::Forward
     }
@@ -123,10 +117,8 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
         // We also track them, though this set is currently unused.
         ctx.supported_formats.insert(format);
 
-        if let Some(internal_id) = ctx.host_dmabuf_id {
-            if ctx.last_sender_id == internal_id {
-                return Action::Drop;
-            }
+        if ctx.is_internal_dmabuf_id(ctx.last_sender_id) {
+            return Action::Drop;
         }
         // if format == 0x34324241 || format == 0x34324258 {
         //     return Action::Drop;
@@ -370,23 +362,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 return Action::Drop;
             }
         };
-
-        let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
-
-        // --- DEBUG PRINT ---
-        let format_hex = format!("{:x}", modifier);
-        let mod_str = if modifier == 0 {
-            "LINEAR".to_string()
-        } else if modifier == 0x00ffffffffffffff {
-            "INVALID (Implicit)".to_string()
-        } else {
-            format!("EXPLICIT (0x{})", format_hex)
-        };
-
-        eprintln!(
-            "[PROXY] Client creating buffer -> Plane: {}, Stride: {}, Modifier: {}",
-            plane_idx, stride, mod_str
-        );
 
         let params_id = ctx.last_sender_id;
         if let Some(list) = ctx.pending_params.get_mut(&params_id) {

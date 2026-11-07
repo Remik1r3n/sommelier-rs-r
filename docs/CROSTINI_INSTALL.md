@@ -29,17 +29,17 @@ ls -l /opt/google/cros-containers/bin/Xwayland   # 用 -X 时需要
 ## 1. 把 `.deb` 放进容器
 
 包名格式：`sommelier-rs-r_<版本>_amd64.deb`，例如
-`sommelier-rs-r_0.3.5-r_amd64.deb`。
+`sommelier-rs-r_0.3.6-r_amd64.deb`。
 
 三种方式任选：
 
 ```bash
 # A. 从 ChromeOS「文件」应用把 .deb 放进 Linux 文件 / MyFiles/Downloads
-sudo dpkg -i /mnt/chromeos/MyFiles/Downloads/sommelier-rs-r_0.3.5-r_amd64.deb
+sudo dpkg -i /mnt/chromeos/MyFiles/Downloads/sommelier-rs-r_0.3.6-r_amd64.deb
 
 # B. 从别的机器 scp 进来（把地址换成你的容器地址）
-scp -P <port> sommelier-rs-r_0.3.5-r_amd64.deb <user>@<container-ip>:~/
-sudo dpkg -i ~/sommelier-rs-r_0.3.5-r_amd64.deb
+scp -P <port> sommelier-rs-r_0.3.6-r_amd64.deb <user>@<container-ip>:~/
+sudo dpkg -i ~/sommelier-rs-r_0.3.6-r_amd64.deb
 
 # C. 直接在容器里从源码重建（见 §10）
 bash packaging/build-deb.sh
@@ -65,7 +65,7 @@ sudo apt-get -f install -y
 确认安装结果：
 
 ```bash
-sommelier-rs-r --version        # 0.3.5-r
+sommelier-rs-r --version        # 0.3.6-r
 dpkg -L sommelier-rs-r          # 查看装了哪些文件
 sommelier-rs-r --help | head -20
 ```
@@ -300,9 +300,11 @@ sommelier-rs-r --transport=virtgpu --force-drm-device=/dev/dri/renderD128 --sock
 
 **目前不建议在生产使用习惯里直接替换**，原因见
 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4：
-`--peer-pid` / `--client-fd` 的 parent/child fd 传递、`wl_drm` 本地模拟、
-`--viewport-resize` 的指针补偿、stylus→tablet 转换、Perfetto/stats 等还未 1:1 对齐。
-真机上现役主线实例确实在被 QQ / VSCode 用 `--peer-pid --client-fd` 调用。
+`--peer-pid` / `--client-fd` 的 parent/child fd 传递（真机上现役主线实例确实
+在被 QQ / VSCode 这样调用）、`sl_calculate_scale_for_xwayland` 的完整重算、
+`--viewport-resize` 的指针补偿、X11 screen DPI、stylus→tablet 转换、
+Perfetto/stats 等还未 1:1 对齐。`wl_drm` 本地模拟与两个 Crostini IME 协议
+已在 `v0.3.6-r` 补齐，不再是阻塞项。
 
 如果只是想试，流程是：
 
@@ -353,10 +355,11 @@ ls -lh dist/sommelier-rs-r_*_amd64.deb
 | `bind: Address already in use` / socket 已存在 | 换了实例名，或清掉陈旧文件：`rm -f "$XDG_RUNTIME_DIR"/wayland-wb*` |
 | `X display :9 already in use` | 上一次测试留下了孤儿 Xwayland。先 `pgrep -af "[X]wayland.elf :9"` 再按 PID `kill`；**不要**用 `pkill -f "Xwayland.elf :9"`，那会连执行 pkill 的 shell 自己一起杀掉 |
 | `Can't open display: (null)` | 命令忘了写 `DISPLAY=:9`；`export DISPLAY=:9` 或每次显式加前缀 |
-| `glamor: 'wl_drm' not supported` | 已知差距（见 `MAINLINE_PARITY.md` §4），Xwayland 会回退软件渲染，功能不受影响 |
+| `glamor: 'wl_drm' not supported` | `v0.3.5-r` 及更早的已知差距；`v0.3.6-r` 起代理本地模拟 `wl_drm` v2，升级后该日志与 `falling back to sw` 都应消失。若仍出现，检查 `SOMMELIER_DRM_DEVICE` / `/dev/dri/renderD*` 是否存在 |
 | `No such file or directory: /dev/wl0` | 指定 `--transport=unix --display=...`，或检查 Linux 容器是否正常运行 |
 | 安装时 `apt-get -f install` 报第三方源无 Release | 修复/临时禁用该源；本包只依赖 Debian 官方仓库的运行时库 |
-| 日志里 `BadWindow` 警告 | X11 窗口退出时的无害竞态，真机实测不影响功能 |
+| 日志里 `BadWindow` 警告 | X11 窗口退出时的无害竞态；`v0.3.6-r` 起 `ChangeWindowAttributes` 改为 unchecked、X11 error 降为 debug，正常日志里不再出现 |
+| `xdpyinfo` 显示 96 DPI（`:0` 是 120 DPI） | 已知差距，见 `MAINLINE_PARITY.md` §4。`xrandr` 的 RandR monitor 已是正确的 `406x270mm`；X screen 的 `monitorResolution` 由 Xwayland 启动时固定，代理侧无法改写。若老式 X11 应用偏小，可手动 `echo "Xft.dpi: 120" \| xrdb -merge` |
 | 应用窗口不显示 / 键盘没焦点 | 看代理日志是否有 `X11 window ... -> host surface ...`；确认应用连的是 `:9` 而不是 `:0` |
 
 调试时把日志调详细：
@@ -390,10 +393,13 @@ sudo dpkg -P sommelier-rs-r     # 彻底清除
 ## 13. 验证状态
 
 Wayland / X11 主链路与 `.deb` 安装均已在 Debian 13 / `penguin` / `/dev/wl0`
-真机端到端验证（143 个单元测试全绿、22 个 host globals、Xwayland `:9`
-真实窗口、剪贴板往返、两个 systemd user 模板秒级 `active`），逐项记录见
-[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5.2 / §5.4。
+真机端到端验证（`v0.3.6-r`：154 个单元测试全绿、25 个 guest globals、
+`wl_drm` v2 与两个 Crostini IME global 的 wire 探针 PASS、Xwayland `:9`
+真实窗口、glamor 不再回退软件渲染、剪贴板往返、两个 systemd user 模板
+秒级 `active`），逐项记录见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md)
+§5.2 / §5.4 / §5.6。
 
-未覆盖：ChromeOS host 侧人工粘贴、`--peer-pid`/`--client-fd` 顶替现役实例、
-长时间稳定性、真实 GPU 加速路径。完整差距见
-[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
+已知差距：X11 `xdpyinfo` 的 X screen 仍为 96 DPI（`xrandr` 的 RandR
+monitor 已与主线同为 120 DPI）；详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
+未覆盖：ChromeOS host 侧人工粘贴与 IME、`--peer-pid`/`--client-fd` 顶替现役
+实例、长时间稳定性、真实 GPU 加速路径。
