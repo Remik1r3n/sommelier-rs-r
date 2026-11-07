@@ -169,10 +169,30 @@
 | Crostini IME 的 XID → surface 解析 | 共享 host display，可直接找到 Xwayland 的 host `wl_surface` | 非 Xwayland 连接走内部创建的 placeholder `wl_surface` | 每 client 独立 host connection 导致 XID 关联表不在同一连接上；真实 ChromeOS host 侧人工 IME 输入尚未验证 |
 | `--viewport-resize` | 在 surface commit 时用 `window->viewport_width/height` 覆盖 host viewport destination | 在 guest `wp_viewport.set_destination` 上按 scale 换算 | 实现路径不同，效果接近；未复刻 `viewport_pointer_scale` 指针补偿 |
 | `zaura_shell` → `zwp_tablet_manager_v2`（stylus） | stylus-v2 协议转换 | 透传 tablet-v2 | 主线做的是协议转换，Rust 保留直接透传 |
-| `--peer-pid` / `--client-fd` / `--peer-cmd-prefix` | parent/child 进程间 fd 传递 | 只解析、不实现 | 与单进程架构不兼容；接受参数避免上游命令行启动失败 |
+| `--peer-pid` / `--client-fd` / `--peer-cmd-prefix` | parent 内部 fork worker 时传 client pid 与 fd，用于 client 身份 / app_id 推断（`:3962-4022`） | 只解析、不实现；parent 换成我们之后这两个参数自然消失 | **不是替换阻塞项**：真机 grep 容器脚本与 systemd 单元无外部 caller，仅主线 parent 自调用；早期文档把它列为阻塞项属误判，已在 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) §2 更正。实际代价是缺少 peer pid → app_id 关联 |
 | `--timing-filename` / `--stats-*` / `--trace-*` | Perfetto / 帧统计 | 只解析、不实现 | 可观测性功能，不影响协议兼容 |
 | INCR 接收侧缓冲策略 | 必须先缓冲 64 KiB 再决定 one-shot / INCR（`:2219-2235`） | 采用预取缓存 + 按需 ConvertSelection | 阈值与 chunk 已对齐，驱动方式不同 |
-| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**（见 §5），Wayland 与 X11 两条主链路均打通，`wl_drm` / IME wire 探针 PASS | 仍未覆盖：ChromeOS **host 侧**粘贴/复制与 IME 的人工确认、`--peer-pid`/`--client-fd` 的 parent/child fork 模型替换现役实例、长时间稳定性与真实 GPU 加速 |
+| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**（见 §5），Wayland 与 X11 两条主链路均打通，`wl_drm` / IME wire 探针 PASS | 仍未覆盖：ChromeOS **host 侧**粘贴/复制与 IME 的人工确认、**把 `wayland-0` / `:0` 整套 drop-in 切换一整轮**、长时间稳定性与真实 GPU 加速 |
+
+### 4.1 替换就绪度（`v0.3.6-r` 复查）
+
+用户问「距离替代主线还差多少」时，答案是：**协议与功能面差得不多了，
+剩下的主要是「一次生产切换演练」与「几项必须由人确认的验证」，而不是
+继续补功能**。完整操作手册见 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md)。
+
+真机复查推翻了一个此前的误判：`--peer-pid` / `--client-fd` 由主线 parent
+**内部** fork worker 时生成（`sommelier.cc:3962-4022`），容器内无外部 caller；
+把 parent 一并换掉后这两个参数自然消失，不再是阻塞项。
+
+| 维度 | 结论 | 证据 |
+|---|---|---|
+| 主线 4 个 unit 的 `ExecStart` 参数 | ✅ 全部可解析 | `--parent`、`--sd-notify="READY=1"`、`--no-exit-with-child`、`--x-auth`、`--enable-xshape`、`--stable-scaling`、`--enable-linux-dmabuf`、尾随 `/bin/sh -c ...`；`config.rs` 的 `trailing_var_arg` 复刻了主线「首个位置参数后停止解析」 |
+| `--parent` 多客户端 | ✅ 真机 PASS | `proxy.rs:1144` bind + `:1165` `accept()` 循环 + `spawn_client`；隔离 socket `wayland-wbpar` 上两个独立 wire 探针先后连接均 PASS（26 globals、`wl_drm` 完整事件、IME bind OK） |
+| 尾随命令链 | ✅ 可执行 | `main.rs:70` `spawn_runprog`；`xwayland.rs:308` 先 set `DISPLAY`，`main.rs:205-207` 再启动 runprog，主线 `xauth` / `. /etc/sommelierrc` / `set-environment` 能拿到正确值 |
+| `Type=notify` | ✅ | `proxy.rs:1153` 在 listener bind 后发 `READY=1`；真机共存单元秒级 `active` |
+| 用户 `SOMMELIER_ACCELERATORS` override | ✅ 保留 | `state.rs:505` 读环境变量；drop-in 与用户 `override.conf` 共存 |
+| 结构差异（需注意） | ⚠️ | 主线是 parent + X11 两进程，我们单进程同时管 socket 与 Xwayland；`--socket` 默认 `wayland-0` 且每实例都 bind，两个 unit 都换时必须给 X11 那个显式改名，或改用单实例方案 |
+| 完整 drop-in 切换演练 | ❌ 未执行 | 会中断当前桌面上的 Linux 应用；需用户确认后按手册 §6→§8→§9 跑一整轮 |
 
 ---
 
@@ -279,7 +299,8 @@
 - `packaging/build-deb.sh` 重建 `sommelier-rs-r_0.3.5-r_amd64.deb`
   （约 1.3 MiB），`dpkg-shlibdeps` 正常解析出 `libc6 (>= 2.39)`、
   `libgbm1`、`libgcc-s1`、`libxkbcommon0`，未走兜底；包内目录权限统一 0755，
-  7 份 `docs/*.md` 全部随包分发。
+  当时 7 份 `docs/*.md` 全部随包分发（`v0.3.6-r` 起为 8 份，新增
+  `REPLACE_MAINLINE.md`）。
 - `sudo dpkg -i` 从 `0.3.4-r` 原地升级到 `0.3.5-r`；`--help` 中主线兼容参数
   （`--peer-pid` / `--client-fd` / `--timing-filename` / `--stats-summary` /
   `--trace-filename` 等）仍全部可解析。

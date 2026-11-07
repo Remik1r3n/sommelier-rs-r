@@ -132,14 +132,19 @@
 1. **ChromeOS host 侧的人工交互尚未验证。** Wayland 与 X11 两条主链路已在
    Debian 13 / `penguin` / `/dev/wl0` 真机端到端跑通（见 §7 与
    [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5），但「X11 应用复制 → 在
-   ChromeOS 界面里粘贴」需要人工在 host 侧确认；用 `--peer-pid`/`--client-fd`
-   顶替现役实例、长时间稳定性与真实 GPU 加速路径同样未覆盖。
+   ChromeOS 界面里粘贴」与 ChromeOS 输入法打字需要人工在 host 侧确认；
+   把 `wayland-0` / `:0` 整套 drop-in 切换一整轮（会中断当前桌面）、长时间
+   稳定性与真实 GPU 加速路径同样未覆盖。替换手册与就绪度评估见
+   [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md) 与
+   [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4.1。
 2. **explicit fence**：`--explicit-fence` 与
    `zwp_linux_explicit_synchronization_v1` XML 就绪，但未接入
    `linux_explicit_synchronization` 的 fence 收发逻辑；该协议目前按内部
    global 过滤，不向 guest 暴露。
-3. **`--parent` 语义简化**：主线是 fork 出独立 worker 进程，本项目是同一进程内
-   的 tokio task；隔离性弱于主线。
+3. **`--parent` 语义简化**：主线 fork 独立 worker 进程，本项目是同一进程内
+   的 tokio task；隔离性弱于主线，但 `UnixListener` + `accept()` 循环的多客户端
+   能力已在真机用两个独立 wire 探针验证 PASS。`--peer-pid` / `--client-fd`
+   只是主线 parent 内部 fork 参数，替换 parent 后自然消失，**不是替换阻塞项**。
 4. **大体积剪贴板载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，
    上限 4 MiB；超过上限或非预取类型由延迟 `SelectionRequest` 触发按需
    获取，1.5 s 内未取到会按 ICCCM 回复 property NONE。X11 → host / guest

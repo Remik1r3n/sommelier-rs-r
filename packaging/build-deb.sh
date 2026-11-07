@@ -136,6 +136,7 @@ Description: X11-capable Wayland proxy for ChromeOS Crostini (Rust)
  .
  Quick start: sommelier-rs-r --socket=wayland-wb -- /path/to/app
  Full guide: /usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md
+ Replacing upstream: /usr/share/doc/sommelier-rs-r/REPLACE_MAINLINE.md
 EOF
 
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
@@ -146,6 +147,7 @@ case "$1" in
     echo "sommelier-rs-r: binary installed at /usr/bin/sommelier-rs-r"
     echo "sommelier-rs-r: quick start -- sommelier-rs-r --socket=wayland-wb -- /path/to/app"
     echo "sommelier-rs-r: guide       -- /usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md"
+    echo "sommelier-rs-r: replace upstream (optional) -- /usr/share/doc/sommelier-rs-r/REPLACE_MAINLINE.md"
     echo "sommelier-rs-r: no service enabled; the live sommelier is untouched"
     ;;
 esac

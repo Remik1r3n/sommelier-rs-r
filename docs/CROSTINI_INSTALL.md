@@ -296,32 +296,31 @@ sommelier-rs-r --transport=virtgpu --force-drm-device=/dev/dri/renderD128 --sock
 
 ---
 
-## 9. 想真正「替换」主线 sommelier？（进阶，先读）
+## 9. 想真正「替换」主线 sommelier？
 
-**目前不建议在生产使用习惯里直接替换**，原因见
-[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4：
-`--peer-pid` / `--client-fd` 的 parent/child fd 传递（真机上现役主线实例确实
-在被 QQ / VSCode 这样调用）、`sl_calculate_scale_for_xwayland` 的完整重算、
-`--viewport-resize` 的指针补偿、X11 screen DPI、stylus→tablet 转换、
-Perfetto/stats 等还未 1:1 对齐。`wl_drm` 本地模拟与两个 Crostini IME 协议
-已在 `v0.3.6-r` 补齐，不再是阻塞项。
+`v0.3.6-r` 之后这已经是一个**可操作的选项**，完整手册见
+[`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md)：包含启动链路对照、前置自检、
+只切 `0` 保留 `1` 的灰度策略、systemd drop-in 写法、验收清单、一键回滚
+与已知降级。
 
-如果只是想试，流程是：
+要点先说清楚：
 
-```bash
-# 1. 停掉主线（会关掉正在跑的 Linux 应用窗口，先保存工作）
-systemctl --user stop sommelier@0 sommelier@1
-systemctl --user stop sommelier-x@0 sommelier-x@1
+- **能力已具备**：主线 4 个 unit 的 `ExecStart` 参数全可解析；`--parent` 是
+  真正的多客户端 listener（真机双客户端探针 PASS）；单实例可同时提供
+  `wayland-0` + `:0`；尾随 `/bin/sh -c ...`（`xauth`、`. /etc/sommelierrc`、
+  `set-environment`）会被执行；`--peer-pid` / `--client-fd` 经复查只是主线
+  parent 内部 fork worker 的参数，**不是替换阻塞项**（详见手册 §2）。
+- **推荐可灰度、可回滚**：用 drop-in 覆盖 `sommelier-x@0.service` 的
+  `ExecStart`，mask `sommelier@0.service`，保留 `sommelier@1` /
+  `sommelier-x@1` 主线不动作为应急与 A/B 对照。回滚只删用户级 drop-in。
+- **仍需人工确认**：ChromeOS host 侧复制粘贴与 IME、长期稳定性、真实 GPU
+  加速；以及「把 `wayland-0` / `:0` 整套切过去一整天」的完整演练尚未在真机
+  执行（会中断当前桌面，需要你确认后再做）。
+- **已知降级**：`xdpyinfo` X screen 仍是 96 DPI（`xrandr` monitor 已与主线
+  一致），用 `~/.sommelierrc` 写 `Xft.dpi: 120` 兜底，详见手册 §10。
 
-# 2. 用主线原来的 socket 名启动我们的代理
-sommelier-rs-r --transport=auto --virtio-wl /dev/wl0 --socket=wayland-0 -X --x-display=0
-
-# 3. 回滚
-systemctl --user start sommelier@0 sommelier@1
-```
-
-更稳妥的做法是给主线 unit 做 drop-in 覆盖 `ExecStart`，而不是 kill 进程，
-并且**先在 `wayland-wb` / `:9` 上把你的应用全跑通**。
+默认安装（§2）始终保持共存，**不会替换主线、不动现役 `wayland-0/1`
+与 `:0/:1`**；本节是纯可选的进阶步骤。
 
 ---
 
@@ -401,5 +400,6 @@ Wayland / X11 主链路与 `.deb` 安装均已在 Debian 13 / `penguin` / `/dev/
 
 已知差距：X11 `xdpyinfo` 的 X screen 仍为 96 DPI（`xrandr` 的 RandR
 monitor 已与主线同为 120 DPI）；详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §4。
-未覆盖：ChromeOS host 侧人工粘贴与 IME、`--peer-pid`/`--client-fd` 顶替现役
-实例、长时间稳定性、真实 GPU 加速路径。
+替换主线的完整操作手册见 [`REPLACE_MAINLINE.md`](REPLACE_MAINLINE.md)。
+未覆盖：ChromeOS host 侧人工粘贴与 IME、**把 `wayland-0` / `:0` 整套 drop-in
+切换一整轮**（会中断当前桌面，需确认后执行）、长时间稳定性、真实 GPU 加速路径。
