@@ -111,22 +111,21 @@ pub struct X11Runtime {
     pub display: String,
     /// PID of the Xwayland child.
     pub pid: i32,
-    /// Compositor side of Xwayland's `WAYLAND_SOCKET` connection.
-    ///
-    /// This fd is *owned by the caller*: `start_x11` deliberately transfers
-    /// ownership out of RAII (via `into_raw_fd`) so the proxy can turn it into
-    /// a dedicated `wl_client`. The caller must close it when done.
-    pub xwayland_client_fd: RawFd,
     /// The WM OS thread, if it was spawned successfully.
     pub wm_thread: Option<JoinHandle<()>>,
 }
 
-/// Create a `SOCK_STREAM | SOCK_CLOEXEC` unix socketpair.
+/// Create the socketpair Xwayland uses as its `WAYLAND_SOCKET`.
+///
+/// This is created by `main` *before* the proxy starts: Xwayland must be able
+/// to talk to the Wayland proxy before it writes the display number to
+/// `-displayfd`, so the compositor end has to be handed to `proxy::run()`
+/// immediately. Only the child end is passed into [`start_x11`].
 ///
 /// CLOEXEC is intentionally set on every fd; `pre_exec` below clears it only
 /// for the three fds the child actually needs, so no stray descriptors leak
 /// into Xwayland.
-fn make_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
+pub fn make_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds: [libc::c_int; 2] = [0, 0];
     let rc = unsafe {
         libc::socketpair(
@@ -218,14 +217,14 @@ fn read_display_number(fd: RawFd, timeout: Duration) -> io::Result<String> {
 pub fn start_x11(
     opts: X11Options,
     bridge: Arc<X11Bridge>,
+    wl_child: OwnedFd,
 ) -> Result<X11Runtime, Box<dyn Error + Send + Sync>> {
     // ds[0] is read by us, ds[1] is written by Xwayland.
     let (display_parent, display_child) = make_socketpair()?;
     // wm[0] becomes our X11 WM connection, wm[1] is passed via -wm.
     let (wm_parent, wm_child) = make_socketpair()?;
-    // wl[0] is the compositor side (returned to the proxy), wl[1] is
-    // WAYLAND_SOCKET in the child.
-    let (wl_parent, wl_child) = make_socketpair()?;
+    // The compositor side (wl[0]) was already handed to proxy::run() by main;
+    // wl_child is the WAYLAND_SOCKET end owned by the Xwayland child.
 
     let display_child_fd = display_child.as_raw_fd();
     let wm_child_fd = wm_child.as_raw_fd();
@@ -328,9 +327,6 @@ pub fn start_x11(
     let (stream, _peer_addr) = DefaultStream::from_unix_stream(wm_stream)?;
     let conn = RustConnection::connect_to_stream(stream, 0)?;
 
-    // Transfer ownership of the compositor-side Wayland fd to the caller.
-    let xwayland_client_fd = wl_parent.into_raw_fd();
-
     let bridge_for_thread = bridge.clone();
     let atoms = AtomTable::new();
     let wm_thread = std::thread::Builder::new()
@@ -345,7 +341,6 @@ pub fn start_x11(
     Ok(X11Runtime {
         display,
         pid,
-        xwayland_client_fd,
         wm_thread: Some(wm_thread),
     })
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use clap::Parser;
+use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::process::{Command, Stdio};
 
@@ -148,45 +149,79 @@ async fn main() {
     );
 
     // ---- X11 / XWayland -------------------------------------------------
-    // A failure to start Xwayland must not take down the Wayland proxy: this
-    // mirrors mainline sommelier, which keeps serving Wayland clients when
-    // the X11 half is unavailable (e.g. missing Xwayland binary).
+    // Xwayland writes its display number to -displayfd only AFTER completing
+    // its initial Wayland handshake. Mainline serves that handshake and the
+    // displayfd from one event loop; our Tokio runtime is current_thread, so
+    // the blocking displayfd wait must not run on the main task. We therefore
+    // create the WAYLAND_SOCKET pair here, hand the compositor end to
+    // proxy::run() immediately, and start Xwayland on a plain OS thread.
+    // A failure to start Xwayland must not take down the Wayland proxy, which
+    // mirrors mainline behaviour.
     let (bridge, wm_commands, xwayland_client_fd) = if cfg.x11_enabled {
         let (b, rx) = x11::X11Bridge::new();
-        match x11::start_x11(cfg.x11.clone(), b.clone()) {
-            Ok(runtime) => {
-                let x11::X11Runtime {
-                    display,
-                    pid,
-                    xwayland_client_fd,
-                    wm_thread,
-                } = runtime;
-                log::info!(
-                    "X11 forwarding ready on DISPLAY={} (Xwayland pid {})",
-                    display,
-                    pid
-                );
-                // Keep the WM thread joined by a watchdog so a panic in the
-                // WM loop is reported instead of silently degrading X11.
-                // Wayland clients keep working either way.
-                if let Some(handle) = wm_thread {
-                    let _ = std::thread::Builder::new()
-                        .name("sommelier-x11-wm-watchdog".to_string())
-                        .spawn(move || {
-                            if handle.join().is_err() {
-                                log::error!(
-                                    "X11 WM thread panicked; X11 windows are no longer managed"
+        match x11::make_xwayland_socketpair() {
+            Ok((wl_parent, wl_child)) => {
+                let fd = wl_parent.into_raw_fd();
+                let opts = cfg.x11.clone();
+                let bridge_for_thread = b.clone();
+                let mut cfg_for_thread = cfg.clone();
+                let started = std::thread::Builder::new()
+                    .name("sommelier-x11-starter".to_string())
+                    .spawn(move || {
+                        match x11::start_x11(opts, bridge_for_thread, wl_child) {
+                            Ok(runtime) => {
+                                log::info!(
+                                    "X11 forwarding ready on DISPLAY={} (Xwayland pid {})",
+                                    runtime.display,
+                                    runtime.pid
                                 );
-                            } else {
-                                log::warn!("X11 WM thread exited");
+                                // Keep the WM thread joined by a watchdog so a
+                                // panic in the WM loop is reported instead of
+                                // silently degrading X11.
+                                if let Some(handle) = runtime.wm_thread {
+                                    let _ = std::thread::Builder::new()
+                                        .name("sommelier-x11-wm-watchdog".to_string())
+                                        .spawn(move || {
+                                            if handle.join().is_err() {
+                                                log::error!(
+                                                    "X11 WM thread panicked; X11 windows are no longer managed"
+                                                );
+                                            } else {
+                                                log::warn!("X11 WM thread exited");
+                                            }
+                                        });
+                                }
                             }
-                        });
+                            Err(e) => {
+                                log::error!(
+                                    "X11 forwarding unavailable ({}); continuing Wayland-only",
+                                    e
+                                );
+                                // Do not poison runprog with WAYLAND_DISPLAY="."
+                                // when the X11 half never came up.
+                                cfg_for_thread.x11_enabled = false;
+                            }
+                        }
+                        // start_x11 sets DISPLAY / XCURSOR_SIZE; runprog must
+                        // only be launched once that has happened.
+                        if let Some(mut child) = spawn_runprog(&cfg_for_thread) {
+                            match child.wait() {
+                                Ok(status) => log::info!("Child exited with {}", status),
+                                Err(e) => log::warn!("Waiting for child failed: {}", e),
+                            }
+                            if cfg_for_thread.exit_with_child {
+                                std::process::exit(0);
+                            }
+                        }
+                    });
+                if let Err(e) = started {
+                    log::error!("Failed to start X11 thread: {}", e);
                 }
-                (Some(b), Some(rx), Some(xwayland_client_fd))
+                (Some(b), Some(rx), Some(fd))
             }
             Err(e) => {
                 log::error!(
-                    "X11 forwarding unavailable ({}); continuing Wayland-only",
+                    "X11 forwarding unavailable (socketpair: {}); continuing Wayland-only",
                     e
                 );
                 (None, None, None)
@@ -196,18 +231,21 @@ async fn main() {
         (None, None, None)
     };
 
-    // ---- trailing runprog -----------------------------------------------
-    if let Some(mut child) = spawn_runprog(&cfg) {
-        let exit_with_child = cfg.exit_with_child;
-        tokio::task::spawn_blocking(move || {
-            match child.wait() {
-                Ok(status) => log::info!("Child exited with {}", status),
-                Err(e) => log::warn!("Waiting for child failed: {}", e),
-            }
-            if exit_with_child {
-                std::process::exit(0);
-            }
-        });
+    // ---- trailing runprog (Wayland-only mode) ---------------------------
+    // In X11 mode the starter thread launches runprog once DISPLAY is set.
+    if !cfg.x11_enabled {
+        if let Some(mut child) = spawn_runprog(&cfg) {
+            let exit_with_child = cfg.exit_with_child;
+            tokio::task::spawn_blocking(move || {
+                match child.wait() {
+                    Ok(status) => log::info!("Child exited with {}", status),
+                    Err(e) => log::warn!("Waiting for child failed: {}", e),
+                }
+                if exit_with_child {
+                    std::process::exit(0);
+                }
+            });
+        }
     }
 
     if cfg.parent {

@@ -14,7 +14,7 @@
 
 [package]
 name = "sommelier"
-version = "0.3.2-r"
+version = "0.3.3-r"
 edition = "2021"
 description = "sommelier-rs-r: X11-capable Wayland proxy for ChromeOS Crostini"
 license = "Apache-2.0"

@@ -130,7 +130,8 @@ third_party/protocols/*.xml (33)
 ## 6. X11 子系统
 
 ```
-x11/xwayland.rs   socketpair(displayfd / wm / WAYLAND_SOCKET) → spawn Xwayland
+x11/xwayland.rs   WAYLAND_SOCKET pair 由 main 提前创建 → socketpair(displayfd / wm)
+                  → 独立 OS 线程 spawn Xwayland（见 §9 启动顺序）
 x11/wm.rs         SubstructureRedirect + Composite RedirectManual
                   ICCCM/EWMH 属性、WM_S0、CLIPBOARD_MANAGER
                   WL_SURFACE_ID 配对 → WmCommand::CreateToplevel
@@ -218,6 +219,19 @@ host Wayland display，第一个位置参数起为 `[program] [args...]`。
 `main.rs` 负责 X11 条件启动（失败降级为 Wayland-only）、
 `runprog` 子进程与 `exit_with_child`、`sd_notify READY=1`、
 `--print-enabled-features`。
+
+主线把 `SOMMELIER_GLAMOR`、`SOMMELIER_CLIPBOARD_MANAGER`、
+`SOMMELIER_SUPPORT_DAMAGE_BUFFER` 当**字符串**处理（例如只有 `"0"` 才禁用
+glamor），真机 systemd 注入的是 `"1"`。这些变量一律由
+`Config::from_args` 手动读取，**不绑定 clap 的 bool flag**，否则 clap 会以
+`invalid value '1' ... [possible values: true, false]` 拒绝启动。
+
+**X11 启动顺序**：Xwayland 必须先通过 `WAYLAND_SOCKET` 完成 Wayland 握手，
+才会往 `-displayfd` 写 display 号。因此 `main` 提前建好 socketpair，把
+`wl_parent` 立即交给 `proxy::run()`（开头即启动专用 Xwayland client），
+再把 `wl_child` 连同 `start_x11()` 放到独立 OS 线程（Tokio 是
+`current_thread`，不能阻塞 main task）。该线程在 `DISPLAY` / `XCURSOR_SIZE`
+设置完成后才启动 `runprog`。现役主线用单个 event loop 达到同样效果。
 
 ## 10. 构建与验证
 

@@ -9,6 +9,9 @@
 新协议能力、以及少数无法在单进程代理架构下 1:1 复刻的路径，列在
 §3 / §4，属于有意保留，不是遗漏。
 
+后续又在**真实 Crostini 环境**（Debian 13 / `penguin` / `/dev/wl0`）做了
+端到端验证，并据此修掉 3 个只有真机才能暴露的问题，见 §1.5 与 §5。
+
 ---
 
 ## 1. 本轮修正的不一致项
@@ -87,6 +90,17 @@
 | `_NET_SUPPORTED` | 8 个 atom，固定顺序（`:3157-3175`） | 13 个且顺序不同 | 前 8 个与主线逐字节一致，额外实现的 5 个追加在后 |
 | clipboard manager | X11 模式默认开，创建 `CLIPBOARD_MANAGER` owner + XFixes 监听（`:3362-3379`） | 已一致 | 保留 |
 
+### 1.5 真机端到端发现并修复的问题
+
+前四节是静态对照的结果；以下三项只有在真实 Crostini 上**实际运行**才暴露，
+均已修复并在 §5 复验。
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 继承现役 systemd 环境后直接拒绝启动：`error: invalid value '1' for '--glamor' [possible values: true, false]` | 主线把 `SOMMELIER_GLAMOR` / `SOMMELIER_CLIPBOARD_MANAGER` 当**字符串**（只有 `"0"` 禁用），真机注入的是 `"1"`；Rust 却把 6 个 bool flag 直接绑到 clap 的 `env`，clap 只接受 `true/false`。这会让 Rust 版在标准 Crostini 环境下**完全无法启动** | 去掉 `glamor` / `no_clipboard_manager` / `direct_scale` / `stable_scaling` / `x11` / `virtgpu_channel` 的 clap `env` 绑定，改由 `Config::from_args` 按主线字符串语义读取（`virtgpu_channel` 补上 `env_bool`）；新增 `mainline_string_envs_are_not_bound_to_bool_flags` 回归测试，直接断言这些 flag 不再绑 env |
+| 2 | `-X` 启动 10 秒后 `Xwayland displayfd did not contain a display number`，Xwayland 报 `(EE) could not connect to wayland server`，X11 静默降级 | Xwayland 要先完成 Wayland 握手才往 `-displayfd` 写 display 号；原实现在 `proxy::run()` **之前**同步阻塞等 displayfd，而 Xwayland 的 `WAYLAND_SOCKET` fd 要等 `start_x11()` 返回后才交给 proxy，形成死锁。主线用单个 event loop 同时服务两者，不会死锁 | `main` 提前创建 `WAYLAND_SOCKET` socketpair，`wl_parent` 立即交给 `proxy::run()`（开头即 `spawn_client(..., true)`）；`start_x11(..., wl_child)` 移到独立 OS 线程（runtime 是 `current_thread`，不能阻塞 main task），成功后设置 `DISPLAY` 再启动 `runprog`；`X11Runtime` 不再回传 fd |
+| 3 | 真机 `cargo test` 有 1 个失败：`preferred_scale_matches_mainline_round_wire_over_scale` 期望 180、实际 1800 | `Transform::new(0.0)` 会 clamp 到 `MIN_SCALE=0.1`，进不了 `preferred_scale()` 的退化分支，算出 `180/0.1`。Windows 上只能 `cargo check --tests`（不运行），所以此前从未暴露 | 测试改为直接置 `scale = 0.0` / `NaN` 来覆盖防御分支，并补一条断言 |
+
 ---
 
 ## 2. 与主线一致、本轮确认无需改动的部分
@@ -126,7 +140,7 @@
 
 | 项 | 主线 | Rust 现状 | 原因 |
 |---|---|---|---|
-| `wl_drm` 本地模拟 | 从 host `zwp_linux_dmabuf_v1` v2 模拟出 `wl_drm` v2（含 `authenticate`/`create_prime_buffer`） | 仅当 host 自己公布 `wl_drm` 时透传 | 需要 DRM render node + GBM 句柄与 host 认证交互，在 virtio_wl 后端不可靠 |
+| `wl_drm` 本地模拟 | 从 host `zwp_linux_dmabuf_v1` v2 模拟出 `wl_drm` v2（含 `authenticate`/`create_prime_buffer`） | 仅当 host 自己公布 `wl_drm` 时透传 | 需要 DRM render node + GBM 句柄与 host 认证交互，在 virtio_wl 后端不可靠。**真机已观测到后果**：Xwayland 打印 `glamor: 'wl_drm' not supported` / `Failed to initialize glamor, falling back to sw`，即硬件加速路径退化为软件渲染；2D 功能不受影响 |
 | `sl_calculate_scale_for_xwayland` | Xwayland ready 后按 `device_scale_factor × preferred_scale` 重算 `ctx.scale`（`:3507-3549`） | 只实现了 `wp_viewporter` 出现时应用 `desired_scale` | 需要 host `zaura_output` 的 scale/DSF 事件；目前只有 `wl_output.scale` |
 | `wl_output.mode` 宽高公式 | `host_w × ctx.scale × s / applied_scale`（含 aura_shell 的 `applied_scale`） | `trunc(host_w × ctx.scale)` | 两者算出的**逻辑尺寸**一致（Rust 用整数 `wl_output.scale` 承载差值），但 wire 上的 size/scale 数值不同 |
 | `--direct-scale` 时的 `zxdg_output_manager_v1` 内部 bind | 内部 bind 并向每个 output 取 `logical_size` / `logical_position`，用于 direct 模式的坐标换算（`:759-775`） | 不公布也不 bind；`zxdg_output_v1` 事件 handler 保留但不会被触发 | Rust 的 direct 模式直接用 `wl_output` 几何 + `Transform` 换算，不依赖 xdg-output；guest 侧行为一致，但未复刻该 host 侧数据来源 |
@@ -137,24 +151,67 @@
 | `--timing-filename` / `--stats-*` / `--trace-*` | Perfetto / 帧统计 | 只解析、不实现 | 可观测性功能，不影响协议兼容 |
 | INCR 接收侧缓冲策略 | 必须先缓冲 64 KiB 再决定 one-shot / INCR（`:2219-2235`） | 采用预取缓存 + 按需 ConvertSelection | 阈值与 chunk 已对齐，驱动方式不同 |
 | `host_serial == 0` 的首次导出 | 使用真实 seat serial | 启动初期可能为 0 | 需在 guest 内首次输入事件后才有有效 serial |
-| 真实 Crostini 端到端 | — | 未验证 | 无真机环境；由 Debian CI 覆盖编译与单元测试 |
+| 真实 Crostini 端到端 | — | **已在 Debian 13 / `penguin` / `/dev/wl0` 真机验证**（见 §5），Wayland 与 X11 两条主链路均打通 | 仍未覆盖：ChromeOS **host 侧**粘贴/复制的人工确认、`--peer-pid`/`--client-fd` 的 parent/child fork 模型替换现役实例、长时间稳定性与真实 GPU 加速 |
+| WM 的 `BadWindow` 竞态 | 主线对已销毁窗口的操作静默忽略 | 真机日志出现 2 次 `select client window events failed: X11Error { error_kind: Window, ... ChangeWindowAttributes }`（`xmessage` 退出时窗口已销毁） | 无害竞态，X11 会话其余功能正常；未改 |
 
 ---
 
 ## 5. 验证
 
-- `cargo check --target x86_64-unknown-linux-gnu --workspace` — 通过，0 error / 0 代码 warning
-- `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` — 通过
+### 5.1 开发机（Windows）
+
+- `cargo check --target x86_64-unknown-linux-gnu --workspace --tests` — 通过，0 error / 0 代码 warning
 - `cargo fmt --all -- --check` — 通过
 - **CLI 形状实测**：把 `Args` 定义抽到独立 clap crate 在 Windows 本机**实际运行**，
   5 组断言全部通过 —— `--socket` vs `--display`、位置参数 runprog、`--`
   分隔、`--sd-notify` 不吃位置参数、`--scale=1.5junk` / `--dpi=96.5,nonsense`
   宽松解析、全量主线 flag 拼写。
-- 142 个 `#[test]` 全部编译通过。Linux target 测试二进制在本机无法执行
-  （WSL 被安全策略禁用、且缺 Linux linker `cc`），由
-  `.github/workflows/ci-debian.yaml` 在 Debian 13 上运行
-  `cargo test --workspace`。
-- 新增/更新的回归测试覆盖：`--socket` vs `--display` 语义、位置参数 runprog、
-  主线 flag 解析、`--scale` 取整与 `atof`/`atoi` 语义、`--fullscreen-mode`
-  校验、MIME 1:1 与别名、`normalize_targets` 顺序、`gtk_shell1` 桥接、
-  `virtual_x_for_host_x()`。
+- 开发机只能 `cargo check --tests`（无 Linux linker、WSL 被安全策略禁用），
+  **测试二进制从未真正运行过**，这正是 §1.5 第 3 项能漏到真机的原因。
+
+### 5.2 真实 Crostini 环境
+
+环境：FydeOS / ChromeOS 的 `penguin` 容器，`Debian GNU/Linux 13 (trixie)`，
+内核 `6.6.119`，`/dev/wl0` + `/dev/dri/renderD128`，现役主线 sommelier `0.20`
+共 4 个实例（`sommelier@0/1` parent、`sommelier-x@0/1` X11）。
+工具链 `rustc/cargo 1.99.1`、`rustfmt 1.10.0`。
+
+测试全程使用独立 `--socket=wayland-wb` 与独立 `--x-display=9`，**未触碰现役
+`wayland-0/1`、`:0/:1` 或用户的 `~/.Xauthority`**。
+
+- `cargo test --workspace --no-fail-fast` — **143 个测试全部通过**（139 + 4 + 0 doc-tests）
+- `cargo build --workspace` / `cargo fmt --all -- --check` — 通过
+
+**Wayland 链路**（纯 Python wire 客户端，不依赖任何 toolkit）：
+
+- guest socket `/run/user/1000/wayland-wb` 创建成功；`wl_display.get_registry`
+  + `sync` 返回 **22 个 global、0 协议错误**；name 不连续（1,2,4,7,11…）证明来自 host virtwl 真实转发
+- 版本钳制全部命中：`wl_compositor v4`、`wl_output v3`、`wl_seat v5`、
+  `wl_data_device_manager v3`、`xdg_wm_base v3`、`zcr_text_input_extension_v1 v11`
+- `zxdg_output_manager_v1` 未公布；`gtk_shell1 v1` 与 `zwp_text_input_manager_v3`
+  两个 synthetic global 正常出现
+- 绑定 5 个 global + `create_surface` + `get_data_device` 全部成功，proxy 日志零警告
+- host 事件完整转发并改写：`wl_output.geometry x=0 y=0 phys=280x187`、
+  `mode 1920x1280@60000`、`scale 2`、`done`、`wl_seat.capabilities 7`
+
+**X11 链路**（`SOMMELIER_GLAMOR=1`，与现役主线同款环境）：
+
+- Xwayland 1.20.14 在 `:9` 就绪，`xdpyinfo` 返回 `1920x1280 (280x187mm)`
+- `xrandr` 显示 `XWAYLAND0 connected 1920x1280+0+0 ... 280mm x 187mm`，RandR 模拟生效
+- WM 初始化：`_NET_SUPPORTING_WM_CHECK=0x200000`，wm window 的
+  `_NET_WM_NAME="Sommelier"`，`_NET_SUPPORTED` 前 8 个 atom 顺序与主线逐项一致
+- 真实 `xmessage` 窗口被接管（`_NET_FRAME_EXTENTS=1,1,1,1`），proxy 日志
+  `X11 window 400020 -> host surface 50 / xdg_toplevel 53`，键盘 `on_enter/on_leave` 焦点正常
+- 剪贴板 X11 → X11 往返 `readback=wb-e2e-clip-7788`；TARGETS 为
+  `TARGETS` + `UTF8_STRING`（主线 1:1 原样透传）
+- 同一时刻 guest Wayland 客户端收到 `wl_data_device.data_offer` 与 `selection`，
+  offer 的 MIME 即 `UTF8_STRING` 原名 —— **X11 → guest 剪贴板桥接真机打通**
+- X11 模式下普通 guest Wayland 客户端仍能看到 `wl_data_device_manager` /
+  `xdg_wm_base`，只有 Xwayland 连接被过滤，符合主线
+
+### 5.3 回归测试覆盖
+
+`--socket` vs `--display` 语义、位置参数 runprog、主线 flag 解析、
+`--scale` 取整与 `atof`/`atoi` 语义、`--fullscreen-mode` 校验、
+**字符串 env 不再绑定 bool flag**、MIME 1:1 与别名、`normalize_targets` 顺序、
+`gtk_shell1` 桥接、`virtual_x_for_host_x()`、`preferred_scale` 退化分支。

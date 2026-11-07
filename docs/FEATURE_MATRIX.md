@@ -158,11 +158,12 @@
 | `cargo check --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | build script 生成 | ✅ 33 个协议模块 + 1 个聚合模块（34 个 include） |
-| 单元测试 | 142 个 `#[test]` 全部编译通过（本轮新增：CLI 语义 3、gtk_shell1 桥接 3、剪贴板 MIME 与 TARGETS 顺序 2 等） |
+| 单元测试 | **143 个 `#[test]` 在真实 Crostini（Debian 13 / `penguin`）上全部运行通过**（139 + 4 + 0 doc-tests）；本轮新增 env/bool 绑定回归测试，并修正 `preferred_scale` 退化分支测试 |
 | CLI 参数解析 | ✅ 用独立 clap crate 在 Windows 本机**实跑** 6 组形状验证全部通过：`--socket` vs `--display`、位置参数 runprog、`--` 分隔、`--sd-notify` 不吃位置参数、全量主线 flag 拼写、`--help`/`--version` |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
-| Rust 源码规模 | 19,204 行（`sommelier/src` + `wayland_codegen/src`） |
+| Rust 源码规模 | 19,283 行（`sommelier/src` + `wayland_codegen/src`） |
+| 真机端到端 | **已验证**：virtwl → host globals/事件、guest registry 与版本钳制、`gtk_shell1`/text-input-v3 synthetic global、Xwayland `:9` 启动、WM 管理真实 X11 窗口并映射为 host `xdg_toplevel`、RandR 模拟、X11 ↔ guest 剪贴板往返、键盘焦点。详见 [`MAINLINE_PARITY.md`](MAINLINE_PARITY.md) §5 |
 | 真实设备运行 | ❌ 未执行，见 §6.1 |
 
 ### 合并过程中修掉的既有缺陷
@@ -172,7 +173,7 @@
 3. `last_sender_id` 方向混用 → 增加方向专用字段，旧字段保持兼容；
 4. `--virtgpu-channel` 是死参数 → 真正接入 `connect_host()`；
 5. `VirtGpuChannel::new()` / `Allocator::new()` 不支持指定设备 → `new_with_device` / `with_device`；
-6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.2-r`）；
+6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.3-r`）；
 7. `virtwl` 的 `&String` handler 参数 → 回退为 `&str`；
 8. `WaylandConnection::new` 未设 `O_NONBLOCK`（virtwl 修复，已保留）；
 9. EOF 误断连（main 修复，已回补）。

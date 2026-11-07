@@ -90,7 +90,7 @@
 
 | 项目 | 结果 |
 |---|---|
-| 工程目录 | `sommelier-rs-r/`，binary 名 `sommelier-rs-r`，版本 `0.3.2-r` |
+| 工程目录 | `sommelier-rs-r/`，binary 名 `sommelier-rs-r`，版本 `0.3.3-r` |
 | 传输层 | `ConnectionTransport` 三变体 + `Config::resolve_transport` / `validate_transport` |
 | 协议 | 33 个 XML 由 `build.rs` 自动枚举，生成 33 个模块 + `protocols::all` 聚合分发 |
 | X11 | `x11/{mod,bridge,atoms,xwayland,wm,clipboard,selection}.rs` 七个模块，`main.rs` 条件启动 |

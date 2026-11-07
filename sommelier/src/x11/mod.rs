@@ -32,4 +32,4 @@ pub mod xwayland;
 
 pub use bridge::{WmCommand, WmEvent, X11Bridge, X11WindowInfo};
 pub use selection::SelectionBridge;
-pub use xwayland::{start_x11, X11Options, X11Runtime};
+pub use xwayland::{make_socketpair as make_xwayland_socketpair, start_x11, X11Options};

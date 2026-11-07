@@ -95,7 +95,9 @@ pub struct Args {
     pub local_compositor: Option<String>,
 
     /// Prefer the virtio-gpu cross-domain backend (main branch behaviour).
-    #[arg(long, env = "SOMMELIER_VIRTGPU_CHANNEL")]
+    /// `SOMMELIER_VIRTGPU_CHANNEL` is read in `Config::from_args`; binding it
+    /// directly to a clap bool would reject common string values such as "1".
+    #[arg(long)]
     pub virtgpu_channel: bool,
 
     /// Force the no-op driver: no VM channel, require --local-compositor.
@@ -114,11 +116,13 @@ pub struct Args {
     pub scale: Option<String>,
 
     /// Do not round the scale to an integer (direct-scale mode).
-    #[arg(long, env = "SOMMELIER_DIRECT_SCALE")]
+    /// `SOMMELIER_DIRECT_SCALE` is read in `Config::from_args`.
+    #[arg(long)]
     pub direct_scale: bool,
 
     /// Stable scaling (integer-aligned coordinates).
-    #[arg(long, env = "SOMMELIER_STABLE_SCALING")]
+    /// `SOMMELIER_STABLE_SCALING` is read in `Config::from_args`.
+    #[arg(long)]
     pub stable_scaling: bool,
 
     /// Comma-separated DPI buckets, e.g. "96,144,192".
@@ -159,7 +163,8 @@ pub struct Args {
 
     // ---- X11 / XWayland --------------------------------------------------
     /// Enable X11 forwarding by launching Xwayland and acting as its WM.
-    #[arg(short = 'X', long, env = "SOMMELIER_X11")]
+    /// `SOMMELIER_X11` is read in `Config::from_args`.
+    #[arg(short = 'X', long)]
     pub x11: bool,
 
     /// Force an X11 display number (also enables X11 forwarding).
@@ -191,7 +196,9 @@ pub struct Args {
     pub enable_xshape: bool,
 
     /// Disable the X11 clipboard manager.
-    #[arg(long, env = "SOMMELIER_CLIPBOARD_MANAGER")]
+    /// Mainline `SOMMELIER_CLIPBOARD_MANAGER` is a *string* where only a
+    /// literal "0" disables the manager; it is handled in `Config::from_args`.
+    #[arg(long)]
     pub no_clipboard_manager: bool,
 
     /// Allow X11 clients to position their own windows.
@@ -203,7 +210,9 @@ pub struct Args {
     pub allow_xwayland_emulate_screen_pos_size: bool,
 
     /// Use glamor accelerated Xwayland (drop -shm).
-    #[arg(long, env = "SOMMELIER_GLAMOR")]
+    /// Mainline `SOMMELIER_GLAMOR` is a *string* where only "0" disables
+    /// glamor; it is handled in `Config::from_args` (sommelier.cc:4085-4089).
+    #[arg(long)]
     pub glamor: bool,
 
     // ---- protocol / feature switches ------------------------------------
@@ -637,7 +646,7 @@ impl Config {
         } else {
             resolve_transport(
                 &args.transport,
-                args.virtgpu_channel,
+                args.virtgpu_channel || env_bool("SOMMELIER_VIRTGPU_CHANNEL"),
                 args.noop_driver,
                 &virtwl_device,
                 local_compositor.as_deref(),
@@ -772,6 +781,36 @@ mod tests {
         let mut v = vec!["sommelier-rs-r"];
         v.extend_from_slice(extra);
         Args::parse_from(v)
+    }
+
+    #[test]
+    fn mainline_string_envs_are_not_bound_to_bool_flags() {
+        use clap::CommandFactory;
+        // Crostini's systemd units export SOMMELIER_GLAMOR="1" and may export
+        // SOMMELIER_CLIPBOARD_MANAGER="1". Mainline treats these as strings,
+        // not booleans. Binding them straight to a clap bool makes clap abort
+        // startup with: invalid value '1' ... [possible values: true, false].
+        let cmd = Args::command();
+        for id in [
+            "glamor",
+            "no_clipboard_manager",
+            "direct_scale",
+            "stable_scaling",
+            "x11",
+            "virtgpu_channel",
+        ] {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("missing clap arg {id}"));
+            assert!(
+                arg.get_env().is_none(),
+                "{id} must not bind a string env var to a bool flag"
+            );
+        }
+        // The flags themselves remain usable.
+        assert!(args(&["--glamor"]).glamor);
+        assert!(!args(&[]).glamor);
     }
 
     #[test]

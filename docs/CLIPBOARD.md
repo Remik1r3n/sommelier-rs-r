@@ -121,8 +121,14 @@ INCR property 写的是 **chunk size** 而非总长度（`:2250-2257`）。
 - **大载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，上限 4 MiB；
   其余由延迟 `SelectionRequest` 按需获取，1.5 s 超时按 ICCCM 回 property NONE。
   X11 → host 方向由 `ConvertSelection` 直接写 fd，不受预取上限约束。
-- **未做真机端到端验证**：开发机是 Windows，只能做 `x86_64-unknown-linux-gnu`
-  交叉类型检查；Debian CI 会执行 `cargo test --workspace`。Crostini guest 里
-  「X11 应用复制 → ChromeOS 里粘贴」这一条仍需人工确认。
+- **真机端到端结论（已验证）**：在 Debian 13 / `penguin` / `/dev/wl0` 的
+  Crostini 真机上，X11 侧 `printf 'wb-e2e-clip-7788' | xclip -selection clipboard`
+  后 `xclip -o` 能原样读回；`TARGETS` 返回 `TARGETS` + `UTF8_STRING`
+  （主线 1:1 原名，无 `text/plain` 改写）。同一时刻，连到 guest socket 的
+  Wayland 客户端收到 `wl_data_device.data_offer` 与 `selection`，offer 的
+  MIME 就是 `UTF8_STRING` 原名，证明 **X11 → guest → host 剪贴板桥接链路
+  已打通**。**仍未人工确认**的是 ChromeOS host 侧实际「粘贴」动作（容器
+  内无法驱动 host UI），以及 `host_serial == 0` 时首次导出是否被 host 接受。
+  详见 `MAINLINE_PARITY.md` §5。
 
 详见 `FEATURE_MATRIX.md` §6。

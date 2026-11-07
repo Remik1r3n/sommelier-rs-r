@@ -935,11 +935,14 @@ mod tests {
             Transform::new(1.25, ScalingMode::Normal, vec![]).preferred_scale(192),
             154
         );
-        // Degenerate scales fall back to the host value.
-        assert_eq!(
-            Transform::new(0.0, ScalingMode::Normal, vec![]).preferred_scale(180),
-            180
-        );
+        // Degenerate scales fall back to the host value. Transform::new()
+        // clamps into [MIN_SCALE, MAX_SCALE], so new(0.0) is actually 0.1 and
+        // would compute 180 / 0.1 = 1800; poke the field to reach the guard.
+        let mut degenerate = Transform::new(1.0, ScalingMode::Normal, vec![]);
+        degenerate.scale = 0.0;
+        assert_eq!(degenerate.preferred_scale(180), 180);
+        degenerate.scale = f64::NAN;
+        assert_eq!(degenerate.preferred_scale(180), 180);
     }
 
     #[test]

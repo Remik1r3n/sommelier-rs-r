@@ -1073,9 +1073,12 @@ fn spawn_client(
 
 /// Main proxy entry point.
 ///
-/// `wm_commands` and `xwayland_client_fd` come from `x11::start_x11()`; when
-/// X11 forwarding is disabled both are `None` and the listener behaves exactly
-/// like upstream sommelier-rs.
+/// `wm_commands` comes from the X11 bridge and `xwayland_client_fd` is the
+/// compositor end of the `WAYLAND_SOCKET` pair created by `main` *before* the
+/// proxy starts. Xwayland needs this connection to be served before it will
+/// report its display number on `-displayfd`, so it must be spawned as soon as
+/// this function begins. With X11 forwarding disabled both are `None` and the
+/// listener behaves exactly like upstream sommelier-rs.
 pub async fn run(
     cfg: Config,
     bridge: Option<Arc<X11Bridge>>,
