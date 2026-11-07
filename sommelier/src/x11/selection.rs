@@ -46,7 +46,9 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::protocols::wayland::{wl_data_device, wl_data_offer, wl_data_source};
+use crate::protocols::wayland::{
+    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
+};
 use crate::state::Context;
 use crate::wire::MessageBuilder;
 use crate::x11::bridge::{WmEvent, X11Bridge};
@@ -144,6 +146,15 @@ struct PendingReceive {
     deadline: Instant,
 }
 
+/// A host `wl_data_source.send(mime, fd)` waiting for the bytes of an X11
+/// `ConvertSelection`. This is the Rust equivalent of mainline
+/// `sl_begin_data_source_send()` + `sl_handle_selection_fd_writable()`.
+struct PendingHostSend {
+    target: String,
+    fd: OwnedFd,
+    deadline: Instant,
+}
+
 /// Per-Wayland-connection clipboard state. Stored behind
 /// `Arc<Mutex<..>>` in `Context` so handlers can hold `&mut Context` at the
 /// same time (see `Context::selection`).
@@ -164,12 +175,67 @@ pub struct SelectionBridge {
     /// (source kind, MIME) pairs already prefetched in this selection epoch,
     /// used to avoid re-issuing `receive`/`send` on every poll.
     prefetched: HashSet<String>,
+    /// host `wl_data_source.send` requests awaiting ConvertSelection bytes.
+    host_sends: Vec<PendingHostSend>,
+    /// TARGETS generation that was last exported to the host compositor.
+    exported_targets_generation: u64,
+    /// MIME list currently offered by the exported host source.
+    exported_mimes: Vec<String>,
 }
 
 impl Default for SelectionBridge {
     fn default() -> Self {
         Self::new(None)
     }
+}
+
+/// Mainline `sl_connect()` binds `wl_data_device_manager` internally and
+/// creates a `wl_data_device` for the default seat, so it can install a
+/// `wl_data_source` that represents the X11 CLIPBOARD owner
+/// (`sommelier.cc:sl_get_selection_targets`). We do the same, but only on the
+/// dedicated Xwayland connection: the host has one selection per seat, so a
+/// single exporter is enough for the whole VM.
+///
+/// The manager is bound in `handler/registry.rs`; the host seat id is learned
+/// from the guest's own `get_data_device` request in `handler/data_device.rs`.
+/// This function is called from both places and is idempotent.
+fn mimes_from_x11_targets(targets: &[String]) -> Vec<String> {
+    let mut mimes: Vec<String> = Vec::new();
+    for target in targets {
+        let mime = mime_for_x11_target(target);
+        if !mime.is_empty() && !mimes.contains(&mime) {
+            mimes.push(mime);
+        }
+    }
+    mimes
+}
+
+pub fn ensure_host_selection_device(ctx: &mut Context) {
+    if !ctx.is_xwayland_client || ctx.host_selection_device_id.is_some() {
+        return;
+    }
+    let (Some(manager), Some(seat)) = (ctx.host_data_device_manager_id, ctx.host_seat_id) else {
+        return;
+    };
+    let id = ctx.shadow_table.allocate_host_id();
+    ctx.shadow_table
+        .track_host_interface(id, "wl_data_device".to_string());
+    ctx.internal_selection_ids.insert(id);
+    ctx.host_selection_device_id = Some(id);
+
+    let mut b = MessageBuilder::new();
+    b.write_u32(id);
+    b.write_u32(seat);
+    ctx.client_to_host_queue.push((
+        b.build_message(manager, wl_data_device_manager::REQ_GET_DATA_DEVICE as u16),
+        Vec::new(),
+    ));
+    log::debug!(
+        "x11: created internal host wl_data_device id={} (manager={}, seat={})",
+        id,
+        manager,
+        seat
+    );
 }
 
 impl SelectionBridge {
@@ -185,6 +251,9 @@ impl SelectionBridge {
             pending_receives: Vec::new(),
             last_targets_generation: 0,
             prefetched: HashSet::new(),
+            host_sends: Vec::new(),
+            exported_targets_generation: u64::MAX,
+            exported_mimes: Vec::new(),
         }
     }
 
@@ -287,6 +356,14 @@ impl SelectionBridge {
     /// object id (or 0); the generated forward path rewrites it for the guest,
     /// so this handler only records state and returns `Action::Forward`.
     pub fn on_host_selection(&mut self, ctx: &mut Context, host_offer: u32) {
+        // The selection we just exported comes back to our *internal* data
+        // device as a host event. Feeding it into the X11 WM would make the
+        // WM take ownership of CLIPBOARD from the very X11 app that copied the
+        // data (mainline avoids this via its `selection_owner` check).
+        if ctx.is_internal_selection_id(ctx.last_sender_id) {
+            log::trace!("x11: ignoring selection echo on internal data device");
+            return;
+        }
         if host_offer == 0 {
             self.active_host_offer = None;
             return;
@@ -322,6 +399,139 @@ impl SelectionBridge {
                     &x11_target_for_mime(mime),
                     bridge.clone(),
                 );
+            }
+        }
+    }
+
+    // ----- X11 -> host Wayland selection export -----
+
+    /// Translate an X11 TARGETS list into a host `wl_data_source` and install
+    /// it as the seat's selection. Equivalent to mainline
+    /// `sommelier.cc:sl_get_selection_targets()`.
+    fn export_x11_targets_to_host(&mut self, ctx: &mut Context, mimes: &[String], generation: u64) {
+        if !ctx.is_xwayland_client || generation == self.exported_targets_generation {
+            return;
+        }
+        self.exported_targets_generation = generation;
+        if ctx.host_serial == 0 {
+            // Mainline also starts with last_serial == 0 and still sends the
+            // request; most compositors accept it. Surface the condition
+            // instead of silently dropping the clipboard export.
+            log::warn!(
+                "x11: exporting CLIPBOARD without an input serial; \
+                 host compositor may reject wl_data_device.set_selection"
+            );
+        }
+        ensure_host_selection_device(ctx);
+        let Some(device) = ctx.host_selection_device_id else {
+            return;
+        };
+
+        if mimes.is_empty() {
+            // Owner disappeared: wl_data_device.set_selection(NULL, serial).
+            let mut b = MessageBuilder::new();
+            b.write_u32(0);
+            b.write_u32(ctx.host_serial);
+            ctx.client_to_host_queue.push((
+                b.build_message(device, wl_data_device::REQ_SET_SELECTION as u16),
+                Vec::new(),
+            ));
+            self.exported_mimes.clear();
+            return;
+        }
+
+        let Some(manager) = ctx.host_data_device_manager_id else {
+            return;
+        };
+        let source = ctx.shadow_table.allocate_host_id();
+        ctx.shadow_table
+            .track_host_interface(source, "wl_data_source".to_string());
+        // Retired sources stay in this set: the host may still deliver a late
+        // `send`/`cancelled` for a source it was reading when we replaced it.
+        ctx.internal_selection_ids.insert(source);
+        ctx.host_selection_source_id = Some(source);
+
+        let mut b = MessageBuilder::new();
+        b.write_u32(source);
+        ctx.client_to_host_queue.push((
+            b.build_message(
+                manager,
+                wl_data_device_manager::REQ_CREATE_DATA_SOURCE as u16,
+            ),
+            Vec::new(),
+        ));
+        for mime in mimes {
+            let mut ob = MessageBuilder::new();
+            ob.write_string(mime);
+            ctx.client_to_host_queue.push((
+                ob.build_message(source, wl_data_source::REQ_OFFER as u16),
+                Vec::new(),
+            ));
+        }
+        let mut sb = MessageBuilder::new();
+        sb.write_u32(source);
+        sb.write_u32(ctx.host_serial);
+        ctx.client_to_host_queue.push((
+            sb.build_message(device, wl_data_device::REQ_SET_SELECTION as u16),
+            Vec::new(),
+        ));
+        self.exported_mimes = mimes.to_vec();
+        log::debug!(
+            "x11: exported {} MIME type(s) to host as wl_data_source id={}",
+            mimes.len(),
+            source
+        );
+    }
+
+    /// Host compositor asked our exported source for data. Equivalent to
+    /// mainline `sl_internal_data_source_send()` /
+    /// `sl_begin_data_source_send()`: run `ConvertSelection` against the X11
+    /// CLIPBOARD owner and write the resulting bytes into the supplied fd.
+    ///
+    /// Returns true when the event was consumed (the caller must not forward
+    /// it to any guest).
+    pub fn on_host_source_send(&mut self, ctx: &Context, mime: &str, fd: RawFd) -> bool {
+        if ctx.host_selection_source_id != Some(ctx.last_sender_id) {
+            return false;
+        }
+        let Some(bridge) = &self.bridge else {
+            return false;
+        };
+        let Ok(owned) = nix::unistd::dup(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }) else {
+            log::warn!("x11: dup host data_source.send fd failed");
+            return true;
+        };
+        let target = x11_target_for_mime(mime);
+        // Never satisfy this request with bytes cached for a previous owner.
+        bridge.invalidate_clipboard_data(&target);
+        self.host_sends.push(PendingHostSend {
+            target: target.clone(),
+            fd: owned,
+            deadline: Instant::now() + RECEIVE_TIMEOUT,
+        });
+        bridge.push_event(WmEvent::RequestClipboardData { target });
+        true
+    }
+
+    /// Complete host `send` requests once ConvertSelection has delivered the
+    /// bytes (or the timeout expires, in which case an empty payload still
+    /// closes the fd so the host does not block forever).
+    fn poll_host_sends(&mut self) {
+        let Some(bridge) = self.bridge.clone() else {
+            self.host_sends.clear();
+            return;
+        };
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.host_sends.len() {
+            let target = self.host_sends[i].target.clone();
+            let data = bridge.clipboard_data_for(&target);
+            let timed_out = self.host_sends[i].deadline <= now;
+            if data.is_some() || timed_out {
+                let pending = self.host_sends.remove(i);
+                spawn_write(pending.fd, data.unwrap_or_default());
+            } else {
+                i += 1;
             }
         }
     }
@@ -378,16 +588,21 @@ impl SelectionBridge {
         }
         if owner_changed {
             self.pending_receives.clear();
+            // Pending host `send`s belong to the previous X11 owner.
+            self.host_sends.clear();
+            self.exported_targets_generation = u64::MAX;
             self.pending_targets_clear();
         }
 
-        // 2. New TARGETS from the X11 owner -> synthetic guest offers.
+        // 2. New TARGETS from the X11 owner -> synthetic guest offers and a
+        //    host wl_data_source (mainline sl_get_selection_targets).
         let (generation, targets) = bridge.clipboard_targets_snapshot();
         if generation != self.last_targets_generation {
             self.last_targets_generation = generation;
-            if let Some(targets) = targets {
-                self.publish_x11_targets(ctx, &targets);
-            }
+            let targets = targets.unwrap_or_default();
+            self.publish_x11_targets(ctx, &targets);
+            let mimes = mimes_from_x11_targets(&targets);
+            self.export_x11_targets_to_host(ctx, &mimes, generation);
         }
 
         // 3. Complete receive() calls whose ConvertSelection finished.
@@ -411,6 +626,10 @@ impl SelectionBridge {
         while let Some(target) = bridge.take_clipboard_request() {
             self.fetch_for_x11(ctx, &target);
         }
+
+        // 5. host -> X11: finish wl_data_source.send() with ConvertSelection
+        //    bytes (or an empty payload on timeout).
+        self.poll_host_sends();
     }
 
     fn pending_targets_clear(&mut self) {
@@ -418,13 +637,7 @@ impl SelectionBridge {
     }
 
     fn publish_x11_targets(&mut self, ctx: &mut Context, targets: &[String]) {
-        let mut mimes: Vec<String> = Vec::new();
-        for target in targets {
-            let mime = mime_for_x11_target(target);
-            if !mime.is_empty() && !mimes.contains(&mime) {
-                mimes.push(mime);
-            }
-        }
+        let mimes = mimes_from_x11_targets(targets);
         if mimes.is_empty() || self.data_devices.is_empty() {
             return;
         }
@@ -755,6 +968,165 @@ mod tests {
         sel.poll(&mut ctx);
         assert!(sel.pending_receives.is_empty());
         drop(read);
+    }
+
+    /// Extract (sender, opcode, payload) from a built Wayland message.
+    fn decode(msg: &[u8]) -> (u32, u16, &[u8]) {
+        let sender = u32::from_ne_bytes(msg[0..4].try_into().unwrap());
+        let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
+        (sender, (word2 & 0xffff) as u16, &msg[8..])
+    }
+
+    fn export_ready_ctx(bridge: Arc<X11Bridge>) -> Context {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.is_xwayland_client = true;
+        ctx.host_data_device_manager_id = Some(10);
+        ctx.host_seat_id = Some(11);
+        ctx.host_serial = 42;
+        ctx.selection.lock().unwrap().set_bridge(Some(bridge));
+        ctx
+    }
+
+    #[test]
+    fn x11_targets_are_exported_as_a_host_data_source() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = export_ready_ctx(bridge.clone());
+        let mut sel = SelectionBridge::new(Some(bridge.clone()));
+        bridge.set_clipboard_targets(vec!["UTF8_STRING".into(), "TARGETS".into()]);
+
+        sel.poll(&mut ctx);
+
+        let q = &ctx.client_to_host_queue;
+        // get_data_device, create_data_source, one offer, set_selection.
+        assert_eq!(q.len(), 4, "unexpected export messages: {:?}", q);
+        let (sender, op, payload) = decode(&q[0].0);
+        assert_eq!(sender, 10);
+        assert_eq!(op, wl_data_device_manager::REQ_GET_DATA_DEVICE as u16);
+        let device = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
+        let seat = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
+        assert_eq!(seat, 11);
+        assert_eq!(ctx.host_selection_device_id, Some(device));
+
+        let (sender, op, payload) = decode(&q[1].0);
+        assert_eq!(sender, 10);
+        assert_eq!(op, wl_data_device_manager::REQ_CREATE_DATA_SOURCE as u16);
+        let source = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
+        assert_eq!(ctx.host_selection_source_id, Some(source));
+        assert!(ctx.is_internal_selection_id(source));
+        assert!(ctx.is_internal_selection_id(device));
+
+        let (sender, op, payload) = decode(&q[2].0);
+        assert_eq!(sender, source);
+        assert_eq!(op, wl_data_source::REQ_OFFER as u16);
+        let mime_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&payload[4..4 + mime_len - 1], b"text/plain;charset=utf-8");
+
+        let (sender, op, payload) = decode(&q[3].0);
+        assert_eq!(sender, device);
+        assert_eq!(op, wl_data_device::REQ_SET_SELECTION as u16);
+        assert_eq!(
+            u32::from_ne_bytes(payload[0..4].try_into().unwrap()),
+            source
+        );
+        assert_eq!(u32::from_ne_bytes(payload[4..8].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn export_only_happens_on_the_xwayland_connection() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = export_ready_ctx(bridge.clone());
+        ctx.is_xwayland_client = false;
+        let mut sel = SelectionBridge::new(Some(bridge.clone()));
+        bridge.set_clipboard_targets(vec!["UTF8_STRING".into()]);
+
+        sel.poll(&mut ctx);
+
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert!(ctx.host_selection_source_id.is_none());
+    }
+
+    #[test]
+    fn empty_targets_clear_the_host_selection() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = export_ready_ctx(bridge.clone());
+        let mut sel = SelectionBridge::new(Some(bridge.clone()));
+        bridge.set_clipboard_targets(vec!["UTF8_STRING".into()]);
+        sel.poll(&mut ctx);
+        assert!(ctx.host_selection_source_id.is_some());
+
+        bridge.set_clipboard_targets(Vec::new());
+        sel.poll(&mut ctx);
+
+        let last = ctx.client_to_host_queue.last().unwrap();
+        let (_, op, payload) = decode(&last.0);
+        assert_eq!(op, wl_data_device::REQ_SET_SELECTION as u16);
+        assert_eq!(u32::from_ne_bytes(payload[0..4].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn host_source_send_converts_x11_selection_and_writes_fd() {
+        use std::io::Read;
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = export_ready_ctx(bridge.clone());
+        ctx.host_selection_source_id = Some(99);
+        ctx.last_sender_id = 99;
+        let mut sel = SelectionBridge::new(Some(bridge.clone()));
+
+        let (read, write) = nix::unistd::pipe().unwrap();
+        assert!(sel.on_host_source_send(&ctx, "text/plain;charset=utf-8", write.as_raw_fd()));
+        drop(write);
+        match bridge.try_recv_event() {
+            Some(WmEvent::RequestClipboardData { target }) => {
+                assert_eq!(target, "UTF8_STRING")
+            }
+            other => panic!("unexpected WmEvent: {:?}", other),
+        }
+
+        bridge.set_clipboard_data("UTF8_STRING".into(), b"from-x11".to_vec());
+        sel.poll(&mut ctx);
+        let mut buf = Vec::new();
+        let mut file = std::fs::File::from(read);
+        file.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"from-x11");
+        assert!(sel.host_sends.is_empty());
+    }
+
+    #[test]
+    fn send_from_an_unknown_source_is_not_consumed() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = export_ready_ctx(bridge.clone());
+        ctx.host_selection_source_id = Some(99);
+        ctx.last_sender_id = 1234;
+        let mut sel = SelectionBridge::new(Some(bridge));
+        let (_read, write) = nix::unistd::pipe().unwrap();
+        assert!(!sel.on_host_source_send(&ctx, "text/plain", write.as_raw_fd()));
+        assert!(sel.host_sends.is_empty());
+    }
+
+    #[test]
+    fn internal_device_selection_echo_is_not_published_to_x11() {
+        let (bridge, _rx) = X11Bridge::new();
+        let mut ctx = export_ready_ctx(bridge.clone());
+        ctx.host_selection_device_id = Some(77);
+        ctx.last_sender_id = 77;
+        let mut sel = SelectionBridge::new(Some(bridge.clone()));
+
+        sel.on_host_selection(&mut ctx, 5);
+
+        assert!(bridge.try_recv_event().is_none());
+    }
+
+    #[test]
+    fn control_atoms_never_become_exported_mimes() {
+        assert_eq!(
+            mimes_from_x11_targets(&[
+                "TARGETS".into(),
+                "TIMESTAMP".into(),
+                "UTF8_STRING".into(),
+                "STRING".into(),
+            ]),
+            vec!["text/plain;charset=utf-8".to_string()]
+        );
     }
 
     /// Helper: publish targets through the bridge held by `sel`.

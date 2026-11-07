@@ -325,15 +325,33 @@ impl Client {
                     Direction::HostToClient => self.ctx.last_host_sender_id = sender_id,
                 }
 
-                let res = match direction {
-                    Direction::ClientToHost => Self::dispatch_request(
-                        &mut self.handler,
-                        &mut self.ctx,
-                        &interface,
-                        &mut msg,
-                    ),
-                    Direction::HostToClient => {
-                        Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
+                if matches!(direction, Direction::HostToClient) {
+                    maybe_update_host_serial(&mut self.ctx, &interface, opcode, &packet[8..]);
+                }
+
+                // Objects we created solely to export the X11 CLIPBOARD into
+                // the host compositor have no guest-side counterpart. Their
+                // events must be consumed here, never forwarded or rewritten.
+                let internal_selection = matches!(direction, Direction::HostToClient)
+                    && self.ctx.is_internal_selection_id(sender_id);
+
+                let res = if internal_selection {
+                    handle_internal_selection_event(&self.ctx, &interface, opcode, &mut msg);
+                    Ok(None)
+                } else {
+                    match direction {
+                        Direction::ClientToHost => Self::dispatch_request(
+                            &mut self.handler,
+                            &mut self.ctx,
+                            &interface,
+                            &mut msg,
+                        ),
+                        Direction::HostToClient => Self::dispatch_event(
+                            &mut self.handler,
+                            &mut self.ctx,
+                            &interface,
+                            &mut msg,
+                        ),
                     }
                 };
                 consumed_fds = msg.fd_offset;
@@ -753,6 +771,58 @@ fn publish_x11_surfaces(ctx: &Context, bridge: Option<&X11Bridge>) {
 /// X11 WM (which turns them into ConfigureNotify / WM_DELETE_WINDOW).
 /// `xdg_surface.configure` is forwarded to Xwayland by the normal generator
 /// path, so Xwayland sends `ack_configure` itself — no synthetic ack needed.
+/// `wl_data_device.set_selection` needs a valid input serial (mainline uses
+/// `ctx->default_seat->seat->last_serial`). Harvest it from the host events
+/// that carry one at the front of their payload.
+fn maybe_update_host_serial(ctx: &mut Context, interface: &str, opcode: u16, payload: &[u8]) {
+    if payload.len() < 4 {
+        return;
+    }
+    let carries_serial = match interface {
+        // enter(0) / button(3), enter(0) / key(3), down(0), enter(1)
+        "wl_pointer" => matches!(opcode, 0 | 3),
+        "wl_keyboard" => matches!(opcode, 0 | 3),
+        "wl_touch" => opcode == 0,
+        "wl_data_device" => opcode == 1,
+        _ => false,
+    };
+    if carries_serial {
+        ctx.host_serial = u32::from_ne_bytes(payload[..4].try_into().unwrap());
+    }
+}
+
+/// Consume events addressed at the host objects we created for the X11
+/// CLIPBOARD export. Only `wl_data_source.send` carries data we need; every
+/// other event (`target`, `cancelled`, `action`, internal data_device offers)
+/// is deliberately swallowed so it cannot leak host object ids to the guest.
+fn handle_internal_selection_event(
+    ctx: &Context,
+    interface: &str,
+    opcode: u16,
+    msg: &mut WireMessage<'_>,
+) {
+    if interface != "wl_data_source" {
+        return;
+    }
+    if opcode == protocols::wayland::wl_data_source::EVT_SEND as u16 {
+        let mime = msg.read_string().unwrap_or_default();
+        let fd = match msg.read_fd() {
+            Ok(fd) if fd >= 0 => fd,
+            _ => {
+                log::warn!("x11: host wl_data_source.send arrived without an fd");
+                return;
+            }
+        };
+        let selection = ctx.selection.clone();
+        let mut guard = selection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.on_host_source_send(ctx, &mime, fd);
+    } else if opcode == protocols::wayland::wl_data_source::EVT_CANCELLED as u16 {
+        log::debug!("x11: internal host wl_data_source cancelled");
+    }
+}
+
 fn forward_x11_toplevel_event(
     transform: &Transform,
     toplevels: &HashMap<u32, HostToplevel>,
@@ -1052,5 +1122,39 @@ pub async fn run(
             }
             Err(e) => log::error!("Accept error: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_serial_is_harvested_from_input_events() {
+        let mut ctx = crate::state::Context::new_for_test(false, false, vec![]);
+        maybe_update_host_serial(&mut ctx, "wl_pointer", 0, &7u32.to_ne_bytes());
+        assert_eq!(ctx.host_serial, 7);
+        maybe_update_host_serial(&mut ctx, "wl_keyboard", 3, &9u32.to_ne_bytes());
+        assert_eq!(ctx.host_serial, 9);
+        maybe_update_host_serial(&mut ctx, "wl_data_device", 1, &11u32.to_ne_bytes());
+        assert_eq!(ctx.host_serial, 11);
+    }
+
+    #[test]
+    fn host_serial_ignores_events_without_a_serial() {
+        let mut ctx = crate::state::Context::new_for_test(false, false, vec![]);
+        maybe_update_host_serial(&mut ctx, "wl_pointer", 5, &99u32.to_ne_bytes());
+        maybe_update_host_serial(&mut ctx, "wl_output", 0, &99u32.to_ne_bytes());
+        maybe_update_host_serial(&mut ctx, "wl_keyboard", 0, &[0u8; 2]);
+        assert_eq!(ctx.host_serial, 0);
+    }
+
+    #[test]
+    fn internal_selection_ids_are_isolated() {
+        let mut ctx = crate::state::Context::new_for_test(false, false, vec![]);
+        assert!(!ctx.is_internal_selection_id(55));
+        ctx.internal_selection_ids.insert(55);
+        assert!(ctx.is_internal_selection_id(55));
+        assert!(!ctx.is_internal_selection_id(56));
     }
 }

@@ -439,6 +439,38 @@ pub struct Context {
     pub host_xdg_wm_base_id: Option<u32>,
     /// Host `wl_compositor` object id.
     pub host_compositor_id: Option<u32>,
+
+    // ---- X11 CLIPBOARD -> host selection export (mainline
+    //      sommelier.cc:sl_get_selection_targets / sl_begin_data_source_send) ----
+    /// `wl_data_device_manager` object bound internally on the host, used only
+    /// to create the selection-export data source / data device. The guest has
+    /// its own bind of the same global.
+    pub host_data_device_manager_id: Option<u32>,
+    /// Host `wl_seat` id, learned from the guest's `get_data_device` request.
+    pub host_seat_id: Option<u32>,
+    /// Internal host `wl_data_device` used for `set_selection`.
+    pub host_selection_device_id: Option<u32>,
+    /// Current host `wl_data_source` representing the X11 CLIPBOARD owner.
+    pub host_selection_source_id: Option<u32>,
+    /// Every host id we allocated for the export path. Events from these
+    /// objects live only in the host namespace and must never be forwarded to
+    /// the guest (there is no guest id to rewrite the sender to).
+    pub internal_selection_ids: HashSet<u32>,
+    /// Most recent serial seen in a host input event. `wl_data_device.
+    /// set_selection` must carry a valid serial; mainline uses
+    /// `ctx->default_seat->seat->last_serial`.
+    pub host_serial: u32,
+}
+
+impl Context {
+    /// True when `id` belongs to an object we created purely to export the X11
+    /// CLIPBOARD selection into the host compositor.
+    pub fn is_internal_selection_id(&self, id: u32) -> bool {
+        self.internal_selection_ids.contains(&id)
+            || self.host_data_device_manager_id == Some(id)
+            || self.host_selection_device_id == Some(id)
+            || self.host_selection_source_id == Some(id)
+    }
 }
 
 impl Context {
@@ -519,6 +551,12 @@ impl Context {
             quirks: Arc::new(Quirks::new()),
             host_xdg_wm_base_id: None,
             host_compositor_id: None,
+            host_data_device_manager_id: None,
+            host_seat_id: None,
+            host_selection_device_id: None,
+            host_selection_source_id: None,
+            internal_selection_ids: HashSet::new(),
+            host_serial: 0,
         }
     }
 

@@ -341,6 +341,13 @@ impl X11Bridge {
         lock(&self.clipboard_data_cache).get(target).cloned()
     }
 
+    /// Drop the cached payload for a single target before starting a new
+    /// `ConvertSelection`. Without this a host `wl_data_source.send` could be
+    /// answered with bytes belonging to an earlier X11 CLIPBOARD owner.
+    pub fn invalidate_clipboard_data(&self, target: &str) {
+        lock(&self.clipboard_data_cache).remove(target);
+    }
+
     /// Consume the oldest queued selection payload.
     pub fn take_clipboard_data(&self) -> Option<(String, Vec<u8>)> {
         lock(&self.clipboard_data).pop_front()
@@ -477,11 +484,48 @@ mod tests {
         );
         assert_eq!(bridge.take_clipboard_targets(), None);
 
+        // ConvertSelection results are cached per target, not queued: every
+        // guest connection must be able to read the same payload.
         bridge.set_clipboard_data("text/plain".into(), b"hello".to_vec());
         assert_eq!(
-            bridge.take_clipboard_data(),
-            Some(("text/plain".to_string(), b"hello".to_vec()))
+            bridge.clipboard_data_for("text/plain"),
+            Some(b"hello".to_vec())
         );
         assert_eq!(bridge.take_clipboard_data(), None);
+
+        // Internal WM control messages remain one-shot queue entries.
+        bridge.set_clipboard_data("x-sommelier/clipboard-owner-changed".into(), vec![1]);
+        assert_eq!(
+            bridge.take_clipboard_data(),
+            Some(("x-sommelier/clipboard-owner-changed".to_string(), vec![1]))
+        );
+    }
+
+    #[test]
+    fn invalidate_clipboard_data_drops_only_one_target() {
+        let (bridge, _rx) = X11Bridge::new();
+        bridge.set_clipboard_data("UTF8_STRING".into(), b"old".to_vec());
+        bridge.set_clipboard_data("image/png".into(), b"png".to_vec());
+        bridge.invalidate_clipboard_data("UTF8_STRING");
+        assert_eq!(bridge.clipboard_data_for("UTF8_STRING"), None);
+        assert_eq!(
+            bridge.clipboard_data_for("image/png"),
+            Some(b"png".to_vec())
+        );
+        bridge.set_clipboard_data("UTF8_STRING".into(), b"new".to_vec());
+        assert_eq!(
+            bridge.clipboard_data_for("UTF8_STRING"),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn new_targets_clear_stale_payload_cache() {
+        let (bridge, _rx) = X11Bridge::new();
+        bridge.set_clipboard_data("UTF8_STRING".into(), b"old-owner".to_vec());
+        bridge.set_clipboard_targets(vec!["UTF8_STRING".into()]);
+        // A fresh TARGETS list means a new X11 CLIPBOARD owner; bytes cached
+        // for the previous one must never answer a new receive/send.
+        assert_eq!(bridge.clipboard_data_for("UTF8_STRING"), None);
     }
 }

@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "sommelier"
-version = "0.3.0-r"
+version = "0.3.1-r"
 dependencies = [
  "clap",
  "drm",

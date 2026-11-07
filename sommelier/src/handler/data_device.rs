@@ -54,8 +54,20 @@ impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {
         Action::Forward
     }
 
-    fn on_get_data_device(&mut self, ctx: &mut Context, id: u32, _seat: u32) -> Action {
-        with_selection(ctx, |sel, _| sel.track_data_device(id));
+    fn on_get_data_device(&mut self, ctx: &mut Context, id: u32, seat: u32) -> Action {
+        with_selection(ctx, |sel, c| {
+            sel.track_data_device(id);
+            // The host seat object that the guest just passed to
+            // get_data_device is also the seat our internal data device must
+            // bind to (mainline's ctx->default_seat). Reusing the guest's
+            // host seat avoids a second bind and its capability/name events.
+            if c.is_xwayland_client && c.host_seat_id.is_none() {
+                if let Some(host_seat) = c.shadow_table.get_host_id(seat) {
+                    c.host_seat_id = Some(host_seat);
+                    crate::x11::selection::ensure_host_selection_device(c);
+                }
+            }
+        });
         Action::Forward
     }
 }

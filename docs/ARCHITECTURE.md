@@ -87,6 +87,11 @@ Client {
 每轮循环末尾 `poll_selection()` 驱动剪贴板状态机并 flush 合成消息；
 50 ms 定时器保证 X11 侧变化在 guest 空闲时也能生效。
 
+额外有一条捷径：`Context::is_internal_selection_id()` 命中的 host→client
+事件（来自内部创建的 `wl_data_source` / `wl_data_device` / manager）不进入
+聚合分发，而是由 `handle_internal_selection_event()` 直接消费。这些对象只存在
+于 host 命名空间，没有 guest id 可供重写 sender，常规转发会污染 guest。
+
 ## 5. 对象 ID 与 codegen
 
 `ShadowTable` 维护四组映射：
@@ -140,39 +145,58 @@ x11/bridge.rs     跨线程共享状态与两条通道
 host 的 `configure` / `close` 事件再经 `WmEvent` 转成 X11
 `ConfigureNotify` / `WM_DELETE_WINDOW`。
 
-## 7. 剪贴板双向桥接
+## 7. 剪贴板三向桥接
+
+与主线 C++ `sommelier` 的逐行对照见 [`CLIPBOARD.md`](CLIPBOARD.md)。
 
 ```mermaid
 sequenceDiagram
-    participant X11 as X11 应用 (CLIPBOARD owner)
+    participant X11 as X11 应用
     participant WM as wm.rs / clipboard.rs
     participant B as X11Bridge
-    participant S as selection.rs
+    participant S as selection.rs (Xwayland 连接)
+    participant H as ChromeOS host compositor
     participant G as guest Wayland 应用
 
+    Note over X11,B: X11 → ChromeOS host / guest Wayland
     X11->>WM: XFixes SelectionNotify (owner 改变)
     WM->>WM: ConvertSelection(TARGETS)
     WM->>B: set_clipboard_targets(names)
     S->>B: poll() 发现 generation 变化
+    S->>H: create_data_source / offer(mime)* / set_selection
     S->>G: data_offer + offer(mimes) + selection
+    H->>S: wl_data_source.send(mime, fd)
     G->>S: wl_data_offer.receive(mime, fd)
     S->>B: WmEvent::RequestClipboardData
-    B->>WM: ConvertSelection(UTF8_STRING)
+    B->>WM: ConvertSelection(atom(mime))
     WM->>B: set_clipboard_data(atom, bytes)
-    S->>G: 异步写回 fd
+    S->>H: 异步写回 host fd
+    S->>G: 异步写回 guest fd
 
-    Note over G,WM: 反向：host offer / guest data source
+    Note over G,X11: host / guest Wayland → X11
     G->>S: set_selection / offer(mime)
-    S->>B: WmEvent::ClipboardTargets
-    S->>G: 预取（wl_data_source.send）或向 host offer receive
-    S->>B: WmEvent::ClipboardData
-    WM->>X11: SelectionNotify（延迟请求则在数据到达后回复）
+    H->>S: data_offer / offer(mime) / selection
+    S->>B: WmEvent::ClipboardTargets / ClipboardData
+    WM->>X11: set_selection_owner(CLIPBOARD) + SelectionNotify
 ```
 
-设计要点：多 client 各自持有 `SelectionBridge`，因此 TARGETS 用
-`(generation, snapshot)` 广播式读取、数据用按 target 的 cache，避免
-`take()` 造成只有一个连接拿到结果。owner 变化会清空 cache 与 pending
-receive，防止用旧 owner 的数据应答新请求。
+设计要点：
+
+- 只有 Xwayland 连接（`Context::is_xwayland_client`）创建内部 host
+  `wl_data_device_manager` / `wl_data_device` / `wl_data_source`。host 的
+  selection 是 per-seat 的，一个 exporter 足够服务整个 VM；内部 manager 由
+  `registry.rs` 绑定，host seat id 从 guest 的 `get_data_device` 请求反查。
+- `Context::internal_selection_ids` 让 `proxy.rs::handle_msgs()` 直接消费这些
+  host 对象的事件（只处理 `wl_data_source.send`），绝不把 host 命名空间的 id
+  转发给 guest；`on_host_selection()` 再过滤一次 selection 回声，避免 WM
+  抢走刚复制的 X11 应用的 owner。退役的旧 source 仍留在集合中，迟到事件也会被吞掉。
+- 多 client 各自持有 `SelectionBridge`，因此 TARGETS 用
+  `(generation, snapshot)` 广播式读取、数据用按 target 的 cache，避免
+  `take()` 造成只有一个连接拿到结果。owner 变化清空 cache 与 pending
+  transfer；每次 `send` 前再对单个 target 做 `invalidate_clipboard_data()`。
+- `wl_data_device.set_selection` 的 serial 由
+  `proxy.rs::maybe_update_host_serial()` 从 host 输入事件首字段提取
+  （主线用 `ctx->default_seat->seat->last_serial`）。
 
 ## 8. 缩放与输出
 

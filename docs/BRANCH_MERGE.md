@@ -90,12 +90,12 @@
 
 | 项目 | 结果 |
 |---|---|
-| 工程目录 | `sommelier-rs-r/`，binary 名 `sommelier-rs-r`，版本 `0.3.0-r` |
+| 工程目录 | `sommelier-rs-r/`，binary 名 `sommelier-rs-r`，版本 `0.3.1-r` |
 | 传输层 | `ConnectionTransport` 三变体 + `Config::resolve_transport` / `validate_transport` |
 | 协议 | 33 个 XML 由 `build.rs` 自动枚举，生成 33 个模块 + `protocols::all` 聚合分发 |
 | X11 | `x11/{mod,bridge,atoms,xwayland,wm,clipboard,selection}.rs` 七个模块，`main.rs` 条件启动 |
 | 缩放 | `transform.rs` 经 `handler/output.rs` 接入 `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件；`handler/viewport.rs` 换算 `wp_viewport` 目标尺寸 |
-| 剪贴板 | `x11/selection.rs` 双向桥接：X11 owner → guest offer / `ConvertSelection` → fd；Wayland offer / source → TARGETS + X11 `SelectionRequest` |
+| 剪贴板 | `x11/selection.rs` 三向桥接：X11 owner → guest `wl_data_offer` + host `wl_data_source` / `set_selection`；host `send` 与 guest `receive` 均由 `ConvertSelection` 异步回写 fd；Wayland offer / source → TARGETS + X11 `SelectionRequest` + 夺回 CLIPBOARD owner。见 [`CLIPBOARD.md`](CLIPBOARD.md) |
 | CLI | `config.rs` 统一 clap + `SOMMELIER_*`，`main.rs` 完成 X11 启动、子进程、sd_notify 接线 |
 | 打包 | systemd unit 与 Debian release workflow 已改为新 binary 名 |
 | 编译 | `cargo check` 与 `cargo check --tests`（`x86_64-unknown-linux-gnu`）均 0 error / 0 warning |
@@ -115,7 +115,30 @@
 6. Debian CI 增加 `cargo test --workspace`、全目标 `cargo check --tests`、
    `cargo fmt --check`。
 
-逐项完成度、剩余限制与 123 个单元测试的编译情况见
-[`docs/FEATURE_MATRIX.md`](FEATURE_MATRIX.md)。需要特别说明的是：
+### 第三轮（tag `v0.3.1-r`）：剪贴板对齐主线
+
+复核主线 C++ 源码后确认：`sommelier.cc` 的 `sl_set_selection()` /
+`sl_get_selection_targets()` / `sl_begin_data_source_send()` 本来就有完整的
+X11 ↔ host 双向剪贴板。第二轮只做到「X11 ↔ guest Wayland」，把 X11 内容合
+成成了 guest `wl_data_offer`，而主线是合成 **host** `wl_data_source`；当时以
+「缺真机验证」为由不实现 host 导出也不成立，主线本身就是可照抄的规格。
+本轮补齐：
+
+1. `registry.rs` 在 Xwayland 连接内部绑定 host `wl_data_device_manager`；
+   `selection.rs::ensure_host_selection_device()` 从 guest 的
+   `get_data_device` 反查 host seat 并创建内部 `wl_data_device`。
+2. X11 TARGETS → `create_data_source` / `offer(mime)`* /
+   `set_selection(source, host_serial)`；host `wl_data_source.send` →
+   `ConvertSelection` → 写回 host fd。owner 清空时发 `set_selection(0, ..)`。
+3. `Context::internal_selection_ids` 在 `proxy.rs` 隔离所有内部 host 对象的
+   事件，避免污染 guest；`on_host_selection()` 过滤 selection 回声。
+4. host / guest Wayland 复制时 `ClipboardBridge::claim_clipboard()` 夺回 X11
+   CLIPBOARD owner（主线 `sl_set_selection` 行为）。
+5. `maybe_update_host_serial()` 从 host 输入事件提取 serial；修正了一个旧测试
+   与按 target 缓存语义不一致、会在 Linux CI 上失败的问题。
+
+逐项完成度、剩余限制与 135 个单元测试的编译情况见
+[`docs/FEATURE_MATRIX.md`](FEATURE_MATRIX.md)；主线对照见
+[`docs/CLIPBOARD.md`](CLIPBOARD.md)。需要特别说明的是：
 **本环境为 Windows 主机，只能做交叉类型检查；Linux 测试二进制由 Debian CI
 执行，仍未在真实 Crostini 设备上跑过 `-X` 启动流程。**

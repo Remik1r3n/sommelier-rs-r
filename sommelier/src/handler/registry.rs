@@ -113,6 +113,36 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             );
         }
 
+        // X11 CLIPBOARD -> host selection export. Mainline binds
+        // wl_data_device_manager internally and uses its own wl_data_device
+        // for set_selection; we do the same on the dedicated Xwayland
+        // connection. The guest still gets the normal global so it can bind
+        // its own manager/data device for Wayland-side copy & paste.
+        if ctx.is_xwayland_client
+            && interface == "wl_data_device_manager"
+            && ctx.host_data_device_manager_id.is_none()
+        {
+            let host_id = ctx.shadow_table.allocate_host_id();
+            ctx.shadow_table
+                .track_host_interface(host_id, interface.to_string());
+            ctx.internal_selection_ids.insert(host_id);
+            ctx.host_data_device_manager_id = Some(host_id);
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(name);
+            builder.write_string(interface);
+            builder.write_u32(version.min(3));
+            builder.write_u32(host_id);
+            ctx.client_to_host_queue.push((
+                builder.build_message(ctx.last_sender_id, wl_registry::REQ_BIND as u16),
+                Vec::new(),
+            ));
+            crate::x11::selection::ensure_host_selection_device(ctx);
+            log::debug!(
+                "x11: bound wl_data_device_manager internally (host_id={})",
+                host_id
+            );
+        }
+
         if interface == "wl_compositor" && !ctx.damage_buffer && version > MAX_COMPOSITOR_VERSION {
             // `wl_surface.damage_buffer` was added in wl_compositor v4 and we
             // cannot translate it for the host. Advertise (and later bind) v3

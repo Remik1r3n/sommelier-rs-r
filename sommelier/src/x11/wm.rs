@@ -1458,7 +1458,15 @@ impl WmState {
                 // sees in TARGETS. Do NOT publish them back through
                 // set_clipboard_targets(): that channel is X11 -> Wayland and
                 // would synthesize a bogus offer on every guest connection.
+                let has_targets = !targets.is_empty();
                 self.clipboard.note_targets(targets);
+                // Mainline `sl_set_selection()` re-asserts CLIPBOARD ownership
+                // on every Wayland selection change. Without this, an X11 app
+                // pasting after a ChromeOS-side copy would ask the previous
+                // X11 owner and get stale data (or nothing).
+                if has_targets {
+                    self.clipboard.claim_clipboard(conn, &atoms_snapshot);
+                }
             }
             WmEvent::ClipboardData { target, data } => {
                 // Likewise `set_clipboard_data` is reserved for ConvertSelection

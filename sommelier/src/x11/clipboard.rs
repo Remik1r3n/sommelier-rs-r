@@ -113,6 +113,26 @@ impl ClipboardBridge {
     /// `selection_window` is the window created in `sl_connect()` that owns
     /// `CLIPBOARD_MANAGER` and `CLIPBOARD`. It may be 0 when clipboard support
     /// is disabled, in which case XFixes notifications are ignored.
+    /// Take ownership of CLIPBOARD whenever the Wayland selection changes.
+    /// Mainline `sl_set_selection()` does exactly this: X11 requestors must
+    /// ask the WM (which serves the Wayland payload) rather than a stale X11
+    /// owner. Re-asserting ownership fires an XFixes notification that
+    /// `handle_xfixes_selection_notify` ignores because the owner is our own
+    /// window, so this cannot feed back into the X11 -> host export path.
+    pub fn claim_clipboard<C: RequestConnection>(&self, conn: &C, atoms: &AtomTable) {
+        if self.selection_window == 0 {
+            return;
+        }
+        if let Err(e) = xproto::set_selection_owner(
+            conn,
+            self.selection_window,
+            atoms.get(X11Atom::Clipboard),
+            0u32,
+        ) {
+            warn!("x11: set_selection_owner(CLIPBOARD) failed: {}", e);
+        }
+    }
+
     pub fn new(selection_window: u32) -> Self {
         Self {
             selection_window,
@@ -284,8 +304,19 @@ impl ClipboardBridge {
             "x11: CLIPBOARD owner {:#x} -> {:#x}",
             previous_owner, ev.owner
         );
-        if ev.owner == 0 || ev.owner == self.selection_window {
-            debug!("x11: CLIPBOARD owner cleared or is ours, ignoring");
+        if ev.owner == 0 {
+            debug!("x11: CLIPBOARD owner cleared");
+            // Publish an empty TARGETS list so the proxy clears both its
+            // synthetic guest offers and the exported host wl_data_source
+            // (mainline does this via wl_data_device_set_selection(NULL)).
+            self.targets.clear();
+            self.data.clear();
+            self.text_data = None;
+            bridge.set_clipboard_targets(Vec::new());
+            return;
+        }
+        if ev.owner == self.selection_window {
+            debug!("x11: CLIPBOARD owner is our own selection window, ignoring");
             return;
         }
 

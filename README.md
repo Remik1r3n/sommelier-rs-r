@@ -10,7 +10,8 @@ ChromeOS 专有扩展等）。
 
 > 分支对比与逐文件合并决策见 [`docs/BRANCH_MERGE.md`](docs/BRANCH_MERGE.md)，
 > 当前架构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，
-> 功能完成度与已知限制见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md)。
+> 功能完成度与已知限制见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md)，
+> 剪贴板双向桥接与主线 C++ 实现的逐行对照见 [`docs/CLIPBOARD.md`](docs/CLIPBOARD.md)。
 
 ## 与上游的关系
 
@@ -37,10 +38,13 @@ ChromeOS 专有扩展等）。
   `wl_output` / `zxdg_output_v1` / `wp_fractional_scale_v1` 事件按虚拟坐标系重写；
   `--viewport-resize` 换算 `wp_viewport.set_destination`，
   `--no-support-damage-buffer` 会把 `wl_compositor` 降到 v3 并改写 `damage_buffer`。
-- **X11 ↔ Wayland 剪贴板桥接**：X11 `CLIPBOARD` owner 转成 guest 侧
-  `wl_data_offer`（按需 `ConvertSelection` 回写 fd）；Wayland offer / data source
-  的 MIME 与小体积文本载荷预取给 X11 `SelectionRequest`，支持 `TARGETS`、
-  `INCR` 与延迟回复。
+- **X11 ↔ Wayland ↔ ChromeOS host 三向剪贴板**（对齐主线 C++ `sommelier`）：
+  X11 `CLIPBOARD` owner 既转成 guest 侧 `wl_data_offer`，也转成 host 侧
+  `wl_data_source` + `set_selection`，因此 ChromeOS host 能直接粘贴 X11 应用
+  复制的内容；host 的 `wl_data_source.send` 由 `ConvertSelection` 异步回写 fd。
+  反向把 host offer / guest data source 的 MIME 与文本载荷预取给 X11
+  `SelectionRequest`，并夺回 CLIPBOARD owner；支持 `TARGETS`、`INCR` 与延迟回复。
+  详见 [`docs/CLIPBOARD.md`](docs/CLIPBOARD.md)。
 - **X11 桌面细节**：`--frame-color` / `--dark-frame-color` 绘制窗口边框并写
   `_NET_FRAME_EXTENTS`；`--allow-xwayland-emulate-screen-pos-size` 依据实时输出
   布局维护 `_XWAYLAND_RANDR_EMU_MONITOR_RECTS`。
@@ -130,29 +134,30 @@ sommelier/
   build.rs             枚举 XML → 生成协议模块与聚合分发
 wayland_codegen/       XML 解析 + Rust 代码生成 + aggregate 生成
 third_party/protocols/ 33 个协议 XML
-docs/                  当前架构、分支合并记录、上游架构基线、功能矩阵
+docs/                  当前架构、剪贴板主线对照、分支合并记录、上游架构基线、功能矩阵
 ```
 
 ## 已知限制
 
 详见 [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md) §6。最需要注意的三点：
 
-1. **X11 → ChromeOS host 剪贴板未导出**：X11 应用复制的内容可以粘贴到 guest
-   Wayland 应用，反过来 guest/host Wayland 应用复制的内容也能粘贴到 X11 应用；
-   但要让 ChromeOS host 侧直接粘贴 X11 内容，还需在 host 连接上合成一个
-   `wl_data_source` 并应答 host 的 `send` 事件，本次未实现。
-2. **尚未在真实 Crostini 设备上做端到端验证**：开发机是 Windows，只能做
+1. **尚未在真实 Crostini 设备上做端到端验证**：开发机是 Windows，只能做
    `x86_64-unknown-linux-gnu` 交叉类型检查；`cargo test` 已加入 Debian CI
-   （`x86_64` 真机执行），但尚未在 Crostini guest 里跑过 `-X` 启动流程。
-3. **explicit fence / seccomp / `--parent` fork 模型**仍是参数或语义级简化，
+   （`x86_64` 真机执行），但尚未在 Crostini guest 里跑过 `-X` 启动流程与
+   「X11 复制 → ChromeOS 粘贴」的 host 协议行为。
+2. **explicit fence / seccomp / `--parent` fork 模型**仍是参数或语义级简化，
    见功能矩阵逐项说明。
+3. **首次复制可能缺 serial**：`wl_data_device.set_selection` 的 serial 取自
+   host 输入事件；进程刚启动尚未收到输入时为 0（主线 `last_serial` 初值同样
+   为 0），此时会打 warning，个别严格校验的 compositor 可能拒绝这一次导出。
 
 ## 版本里程碑
 
 | Tag | 内容 |
 |---|---|
 | `v0.3.0-r-merge-baseline` | 两分支完整对比合并、X11 转发主体、统一 CLI，编译干净 |
-| `v0.3.0-r` | 剪贴板双向桥接、缩放/输出与内部协议正确性修复、RandR 模拟、边框、viewport、CI 真实测试 |
+| `v0.3.0-r` | X11 ↔ guest Wayland 剪贴板、缩放/输出与内部协议正确性修复、RandR 模拟、边框、viewport、CI 真实测试 |
+| `v0.3.1-r` | 按主线补齐 X11 → ChromeOS host 剪贴板导出、host/Wayland 复制夺回 X11 owner、serial 跟踪、内部对象事件隔离 |
 
 ## 其他说明
 

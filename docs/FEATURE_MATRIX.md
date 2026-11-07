@@ -44,7 +44,8 @@
 | X11 窗口边框绘制（frame / dark frame color） | ✅ | `wm.rs::border_color` / `parse_frame_color`，1px X11 border + `_NET_FRAME_EXTENTS`；不做 reparenting frame |
 | `_XWAYLAND_RANDR_EMU_MONITOR_RECTS` | ✅ | `handler/output.rs` 发布虚拟坐标布局 → `bridge.rs` → `wm.rs::update_randr_emu` 写 root 属性（内容不变时不重写） |
 | X11 ↔ guest Wayland 剪贴板互通 | ✅ | `x11/selection.rs`：X11 owner → 合成 `wl_data_device.data_offer`/`offer`/`selection`，`receive` → `ConvertSelection` → 回写 fd；反向追踪 host offer / guest data source，预取小体积文本载荷给 X11 `SelectionRequest` |
-| X11 → ChromeOS host 剪贴板导出 | ❌ | 需要在 host 连接上合成 `wl_data_source` 并应答 `send` 事件，见 §6.1 |
+| X11 → ChromeOS host 剪贴板导出 | ✅ | 对齐主线 `sl_get_selection_targets()`：内部 bind host `wl_data_device_manager` + 内部 `wl_data_device`，X11 TARGETS → `wl_data_source.offer`* → `set_selection`；应答 host `wl_data_source.send`。见 [`docs/CLIPBOARD.md`](CLIPBOARD.md) |
+| host / guest Wayland 复制时夺回 X11 CLIPBOARD owner | ✅ | `ClipboardBridge::claim_clipboard()`，对应主线 `sl_set_selection()` |
 
 ## 3. 缩放 / 坐标 / 输出
 
@@ -118,29 +119,31 @@
 
 ## 6. 已知限制（按影响排序）
 
-1. **X11 → ChromeOS host 剪贴板导出未实现。**
-   - 已打通的是 X11 ↔ guest Wayland：`x11/selection.rs` 合成 guest
-     `wl_data_offer`、按需 `ConvertSelection` 并回写 `receive` 的 fd；反向把
-     host offer / guest data source 的 MIME 与文本载荷预取给 X11。
-   - 若要让 ChromeOS host 侧直接粘贴 X11 内容，还需要在 host 连接上 bind
-     `wl_data_device_manager` / `wl_seat`，合成 host `wl_data_source`、
-     `set_selection`，并应答 host 发来的 `wl_data_source.send(mime, fd)`。
-     该路径会与 host compositor 的 selection 状态直接交互，协议错误会断开
-     整条 host 连接；在缺少真实设备验证的条件下本次不引入。
-2. **未在真实 Crostini 设备上做端到端验证。** 开发机为 Windows 主机，只能做
+> **修订说明**：此前 §6.1 记录的「X11 → ChromeOS host 剪贴板导出未实现」已补齐。
+> 主线 C++ `sommelier` 本来就有完整的双向剪贴板（`sommelier.cc` 的
+> `sl_set_selection` / `sl_get_selection_targets` / `sl_begin_data_source_send`），
+> 上一版把它误判为「需要真机才能做」的风险项，并用 guest 侧合成 offer 代替了
+> host 侧合成 source，方向不对。现按主线语义实现，逐行对照与链路图见
+> [`docs/CLIPBOARD.md`](CLIPBOARD.md)。
+
+1. **未在真实 Crostini 设备上做端到端验证。** 开发机为 Windows 主机，只能做
    `x86_64-unknown-linux-gnu` 交叉类型检查。`cargo test` 已加入 Debian CI
-   （x86_64 runner 真机执行），但 `-X` 启动流程与 ChromeOS host 协议行为
-   仍需在 Crostini guest 内确认。
-3. **explicit fence**：`--explicit-fence` 与
+   （x86_64 runner 真机执行），但 `-X` 启动流程与「X11 应用复制 → ChromeOS
+   粘贴」的 host 协议行为仍需在 Crostini guest 内确认。
+2. **explicit fence**：`--explicit-fence` 与
    `zwp_linux_explicit_synchronization_v1` XML 就绪，但未接入
    `linux_explicit_synchronization` 的 fence 收发逻辑；该协议目前按内部
    global 过滤，不向 guest 暴露。
-4. **`--parent` 语义简化**：主线是 fork 出独立 worker 进程，本项目是同一进程内
+3. **`--parent` 语义简化**：主线是 fork 出独立 worker 进程，本项目是同一进程内
    的 tokio task；隔离性弱于主线。
-5. **大体积剪贴板载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，
+4. **大体积剪贴板载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，
    上限 4 MiB；超过上限或非预取类型由延迟 `SelectionRequest` 触发按需
-   获取，1.5 s 内未取到会按 ICCCM 回复 property NONE。X11 → Wayland 方向
-   不受此限制（`ConvertSelection` 直接回写 fd）。
+   获取，1.5 s 内未取到会按 ICCCM 回复 property NONE。X11 → host / guest
+   Wayland 方向不受此限制（`ConvertSelection` 直接回写 fd）。
+5. **`wl_data_device.set_selection` 的 serial 可能为 0**：`Context::host_serial`
+   由 host 输入事件提取；进程刚启动尚未收到输入时复制，会带 serial 0 发送并
+   打印 warning（主线 `last_serial` 初值同样为 0）。若 ChromeOS compositor
+   严格校验 serial，这一次导出可能被拒绝，下一次输入事件后恢复正常。
 6. **`current_thread` Tokio runtime 是硬约束**：`KeyboardHandler` 中的
    `xkbcommon` 对象 `!Send`，依赖 `unsafe impl Send`；任何改为多线程 runtime
    的尝试都会破坏该不变量。剪贴板的管道读写也因此用 `tokio::fs` 的
@@ -153,12 +156,12 @@
 | `cargo check --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | `cargo check --tests --target x86_64-unknown-linux-gnu --workspace` | ✅ 通过，0 error / 0 warning |
 | build script 生成 | ✅ 33 个协议模块 + 1 个聚合模块（34 个 include） |
-| 单元测试 | 123 个 `#[test]` 全部编译通过（含 X11 子系统 35 个、keyboard 19、transform 17、quirks 14、config 8、output 2、viewport 3、selection 5 等） |
+| 单元测试 | 135 个 `#[test]` 全部编译通过（含 X11 子系统 44 个、keyboard 19、transform 17、quirks 14、config 8、output 2、viewport 3、selection 13、proxy 3 等） |
 | CLI 参数解析 | ✅ 用独立 clap 形状验证实测：位置 display、`--display`、`-- <program>`、常见 flag 组合均正确解析，无歧义/panic |
 | `cargo fmt --all -- --check` | ✅ 通过（已统一格式） |
 | CI | `.github/workflows/ci-debian.yaml`：Debian 13 x86_64 / aarch64 构建、x86_64 `cargo test --workspace`、全目标 `cargo check --tests`、`cargo fmt --check` |
-| Rust 源码规模 | 17,631 行（`sommelier/src` + `wayland_codegen/src`） |
-| 真实设备运行 | ❌ 未执行，见 §6.2 |
+| Rust 源码规模 | 18,267 行（`sommelier/src` + `wayland_codegen/src`） |
+| 真实设备运行 | ❌ 未执行，见 §6.1 |
 
 ### 合并过程中修掉的既有缺陷
 
@@ -167,7 +170,7 @@
 3. `last_sender_id` 方向混用 → 增加方向专用字段，旧字段保持兼容；
 4. `--virtgpu-channel` 是死参数 → 真正接入 `connect_host()`；
 5. `VirtGpuChannel::new()` / `Allocator::new()` 不支持指定设备 → `new_with_device` / `with_device`；
-6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 统一为 `0.3.0-r`；
+6. `Cargo.lock` 中 `sommelier` 版本与 `Cargo.toml` 不一致 → 两者同步（当前 `0.3.1-r`）；
 7. `virtwl` 的 `&String` handler 参数 → 回退为 `&str`；
 8. `WaylandConnection::new` 未设 `O_NONBLOCK`（virtwl 修复，已保留）；
 9. EOF 误断连（main 修复，已回补）。
