@@ -1,6 +1,6 @@
 # 如何贡献
 
-`sommelier-rs-r` 是基于上游 `sommelier-rs` 两个分支合并而来的独立实现，
+`sommelier-rs-r` 是独立的 Rust 实现，以主线 C++ `sommelier` 的行为为兼容基准，
 **不是 Google 官方项目，也不属于 ChromiumOS 组件**。请把改动提交到本仓库，
 不要发往上游 `sommelier-rs` 或 ChromiumOS。
 

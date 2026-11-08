@@ -1,9 +1,9 @@
 # sommelier-rs-r 架构
 
-本文描述**当前代码**的结构。两分支合并时的逐文件决策见
-[`BRANCH_MERGE.md`](BRANCH_MERGE.md)，功能完成度见
+本文描述程序的结构。功能完成度见
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md)，与主线 C++ `sommelier` 的逐项对照见
-[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md)。
+[`MAINLINE_PARITY.md`](MAINLINE_PARITY.md)，安装与使用见
+[`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md)。
 
 ## 1. 角色与边界
 
@@ -104,7 +104,7 @@ Client {
 | `next_guest_server_id` (`0xff000000+`) | host 事件中 `new_id` 在 guest namespace 的新 id |
 
 **关键正确性点**：host→client 事件里的 `new_id` 是 host namespace 的 id，
-绝不能原样交给 guest。`generator.rs` 现在对所有事件 `new_id` 统一调用
+绝不能原样交给 guest。`generator.rs` 对所有事件 `new_id` 统一调用
 `allocate_guest_server_id()`；`handler/data_device.rs` 保留 `data_offer` 的
 手写路径作为互补。
 
@@ -120,7 +120,7 @@ third_party/protocols/*.xml (33)
 
 `protocols::all` 提供 `KNOWN_INTERFACES`、`is_known()`、
 `dispatch_request()` / `dispatch_event()` 与 `impl_generated_delegates!`。
-新增协议只需放入一个 XML，不必再改 `proxy.rs` / `registry.rs`。
+新增协议只需放入一个 XML，`proxy.rs` / `registry.rs` 无需改动。
 
 16 个协议有手写 delegation（见 `proxy.rs` 的
 `impl_sommelier_delegates!` / `ProtocolHandler` 挂载），其余由聚合宏生成纯转发；

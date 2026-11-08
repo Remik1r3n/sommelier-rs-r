@@ -2,15 +2,20 @@
 
 ## 1. 结论先行
 
-**主线 C++ `sommelier` 本来就有完整的 X11 ↔ host 双向剪贴板。** 它不是「缺失功能」，
-也不需要先在真机上验证才有资格实现——主线源码本身就是可照抄的规格。
+**主线 C++ `sommelier` 有完整的 X11 ↔ host 双向剪贴板**，本文以它的源码为规格。
+上游 `sommelier-rs`（`main` 与 `virtwl` 两个分支）没有 X11，只做 guest
+`wl_data_device` ↔ host `wl_data_device` 的代理转发，因此不具备这条链路。
 
-`sommelier-rs`（`main` 与 `virtwl` 两个分支）都没有 X11，因此也没有这条链路；
-它们只做 guest `wl_data_device` ↔ host `wl_data_device` 的代理转发。
-`sommelier-rs-r` 补 X11 时，第一版只做到「X11 ↔ guest Wayland」，把 X11 内容
-合成成了 **guest** 侧的 `wl_data_offer`。这与主线的方向不同：主线是把 X11 内容
-合成 **host** 侧的 `wl_data_source` 并 `set_selection`，从而让 ChromeOS host 和
-所有 guest 应用同时看到它。
+`sommelier-rs-r` 实现三个方向：
+
+- **X11 → ChromeOS host**：X11 内容合成 **host** 侧的 `wl_data_source` 并
+  `set_selection`，让 ChromeOS host 与所有 guest 应用同时看到它；
+- **X11 → guest Wayland**：同一份内容同时合成 **guest** 侧的
+  `wl_data_device.data_offer` / `selection`；
+- **host / guest Wayland → X11**：反向夺回 X11 `CLIPBOARD` owner。
+
+其中 X11 → host 是主线行为的关键：只做 X11 ↔ guest Wayland 无法让 ChromeOS
+host 侧粘贴到 X11 应用复制的内容。
 
 ## 2. 主线代码位置
 
@@ -109,8 +114,8 @@ INCR property 写的是 **chunk size** 而非总长度（`:2250-2257`）。
 - **serial 可能为 0**：`Context::host_serial` 来自真实 host 输入事件（
   `maybe_update_host_serial()` 覆盖 pointer / keyboard / touch / data_device 的
   输入 opcode）。进程刚启动、还未收到任何输入时复制，主线同样会用
-  `last_serial == 0` 发送 `set_selection`；`v0.3.6-r` 起这条日志降为 debug，
-  不再打 warning。ChromeOS compositor 若严格校验 serial 仍可能拒绝这一次
+  `last_serial == 0` 发送 `set_selection`；这条情形按 debug 记录，不产生
+  warning。ChromeOS compositor 若严格校验 serial 仍可能拒绝这一次
   `set_selection`，下一次输入事件后恢复正常。
 - **X11 owner 会被 WM 接管**：host / Wayland 侧复制时，`claim_clipboard()` 让 WM
   成为 X11 owner（主线 `sl_set_selection` 同款行为）。之后 X11 应用粘贴走 WM，
@@ -118,14 +123,13 @@ INCR property 写的是 **chunk size** 而非总长度（`:2250-2257`）。
 - **大载荷**：Wayland → X11 方向只预取文本类与常见图片 MIME，上限 4 MiB；
   其余由延迟 `SelectionRequest` 按需获取，1.5 s 超时按 ICCCM 回 property NONE。
   X11 → host 方向由 `ConvertSelection` 直接写 fd，不受预取上限约束。
-- **真机端到端结论（已验证）**：在 Debian 13 / `penguin` / `/dev/wl0` 的
-  Crostini 真机上，X11 侧 `printf 'wb-e2e-clip-7788' | xclip -selection clipboard`
-  后 `xclip -o` 能原样读回；`TARGETS` 返回 `TARGETS` + `UTF8_STRING`
-  （主线 1:1 原名，无 `text/plain` 改写）。同一时刻，连到 guest socket 的
+- **验证边界**：在 Debian 13 / `penguin` / `/dev/wl0` 的 Crostini 真机上，
+  X11 侧复制经 `xclip -o` 可原样读回；`TARGETS` 返回 `TARGETS` +
+  `UTF8_STRING`（主线 1:1 原名，无 `text/plain` 改写）；同一时刻 guest
   Wayland 客户端收到 `wl_data_device.data_offer` 与 `selection`，offer 的
-  MIME 就是 `UTF8_STRING` 原名，证明 **X11 → guest → host 剪贴板桥接链路
-  已打通**。**仍未人工确认**的是 ChromeOS host 侧实际「粘贴」动作（容器
-  内无法驱动 host UI），以及 `host_serial == 0` 时首次导出是否被 host 接受。
-  详见 `MAINLINE_PARITY.md` §5。
+  MIME 即 `UTF8_STRING` 原名。X11 → guest → host 链路已打通。
+  **仍未人工确认**的是 ChromeOS host 侧实际「粘贴」动作（容器内无法驱动
+  host UI），以及 `host_serial == 0` 时首次导出是否被 host 接受。
 
-详见 `FEATURE_MATRIX.md` §6。
+自测命令见 [`CROSTINI_INSTALL.md`](CROSTINI_INSTALL.md) §7，
+功能状态见 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) §6。

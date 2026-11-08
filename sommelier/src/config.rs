@@ -880,8 +880,8 @@ mod tests {
         assert!(cfg.gpu_accel);
         assert!(cfg.sd_notify);
         assert_eq!(cfg.application_id.as_deref(), Some("org.chromium.test"));
-        // These are no longer placeholder-only: --peer-pid overrides the
-        // SO_PEERCRED pid and --client-fd is served as the first connection.
+        // --peer-pid overrides the SO_PEERCRED pid; --client-fd is served as
+        // the first connection.
         assert_eq!(cfg.peer_pid, Some(42));
         assert_eq!(cfg.client_fd, Some(7));
     }

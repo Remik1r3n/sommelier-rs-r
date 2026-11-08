@@ -39,7 +39,6 @@ if [ -f "$HOME/.cargo/env" ]; then
     . "$HOME/.cargo/env" 2>/dev/null || true
 fi
 
-# .gitattributes pins text files to LF, so a strict version match is enough.
 VERSION="${PKG_VERSION:-$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$ROOT/sommelier/Cargo.toml" | head -n 1)}"
 ARCH="${PKG_ARCH:-$(dpkg --print-architecture)}"
 OUT_DIR="${OUT_DIR:-$ROOT/dist}"
@@ -134,7 +133,9 @@ Description: X11-capable Wayland proxy for ChromeOS Crostini (Rust)
  systemd user templates. The upstream C++ sommelier, its socket names
  (wayland-0/wayland-1) and its X displays (:0/:1) are left untouched.
  .
- Quick start: sommelier-rs-r --socket=wayland-wb -- /path/to/app
+ Choose how to use it: install guide section 1 lists every option with its
+ trade-offs and copy-paste steps.
+ Quick start: sommelier-rs-r --socket=wayland-rs -- /path/to/app
  Full guide: /usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md
  Replacing upstream: /usr/share/doc/sommelier-rs-r/REPLACE_MAINLINE.md
 EOF
@@ -144,11 +145,18 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 set -e
 case "$1" in
   configure)
-    echo "sommelier-rs-r: binary installed at /usr/bin/sommelier-rs-r"
-    echo "sommelier-rs-r: quick start -- sommelier-rs-r --socket=wayland-wb -- /path/to/app"
-    echo "sommelier-rs-r: guide       -- /usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md"
-    echo "sommelier-rs-r: replace upstream (optional) -- /usr/share/doc/sommelier-rs-r/REPLACE_MAINLINE.md"
-    echo "sommelier-rs-r: no service enabled; the live sommelier is untouched"
+    echo ""
+    echo "sommelier-rs-r installed. Nothing is enabled and your current desktop is unchanged."
+    echo ""
+    echo "Pick one (all options, trade-offs and steps are in the guide section 1):"
+    echo "  try once     sommelier-rs-r --socket=wayland-rs -- your-wayland-app"
+    echo "  with X11     sommelier-rs-r --socket=wayland-rs -X --x-display=9 -- xmessage hello"
+    echo "  stay on      systemctl --user start sommelier-rs-r@wayland-rs.service"
+    echo "  replace      see /usr/share/doc/sommelier-rs-r/REPLACE_MAINLINE.md"
+    echo ""
+    echo "  Guide   /usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md"
+    echo "  Help    sommelier-rs-r --help"
+    echo ""
     ;;
 esac
 exit 0

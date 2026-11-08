@@ -25,8 +25,7 @@ use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
 
 /// Push a wire message built by `builder` onto `queue`, binding it to
-/// `sender_id` / `opcode`. Centralizes the (header + payload) assembly that
-/// used to be open-coded with `extend_from_slice` + `(len << 16) | opcode`.
+/// `sender_id` / `opcode`. Centralizes (header + payload) assembly.
 pub(crate) fn push_msg(
     queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
     sender_id: u32,

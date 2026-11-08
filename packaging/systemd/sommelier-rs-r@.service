@@ -6,7 +6,7 @@ Documentation=file:/usr/share/doc/sommelier-rs-r/CROSTINI_INSTALL.md
 Type=notify
 NotifyAccess=all
 # %i is the guest socket name. Keep it distinct from the live upstream
-# sockets (wayland-0 / wayland-1); e.g. sommelier-rs-r@wayland-wb.service.
+# sockets (wayland-0 / wayland-1); e.g. sommelier-rs-r@wayland-rs.service.
 # --socket is the guest listener; --display (unused here) would be the host.
 # SOMMELIER_* variables from the user manager are inherited; use
 # `systemctl --user set-environment NAME=VALUE` or a drop-in Environment=.

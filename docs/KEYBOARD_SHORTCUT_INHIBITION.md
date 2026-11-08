@@ -1,8 +1,8 @@
 # Keyboard Shortcut Inhibition in ChromeOS Exo
 
-> **状态：已实现。** 前几节记录 ChromeOS Exo 侧的机制（上游行为，不随本项目
-> 版本变化），最后一节给出 `sommelier-rs-r` 的实现映射；功能状态见
-> [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) §4。
+> 前半部分说明 ChromeOS Exo 侧的机制（上游行为），
+> [Implementation in sommelier-rs-r](#implementation-in-sommelier-rs-r) 给出本项目的
+> 实现映射；功能状态见 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) §4。
 
 ## Overview
 
@@ -237,7 +237,6 @@ the one that actually works.
 
 - **System sommelier service override** (defines default `SOMMELIER_ACCELERATORS`):
   `/etc/systemd/user/sommelier@0.service.d/cros-sommelier-override.conf`
-  (read directly from the ChromeOS device during investigation)
 
 ### Related Reading
 
